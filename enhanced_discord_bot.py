@@ -859,8 +859,15 @@ async def match_updater(channel_id):
                 await clock.connect_crcon()
 
         # Check if game has ended (time remaining is 0 or very low)
+        # Only check for auto-stop if match has been running for at least 2 minutes
+        # This prevents false triggers on startup
+        match_duration = (datetime.datetime.now(timezone.utc) - clock.match_start_time).total_seconds()
         game_info = clock.get_game_info()
-        if game_info['connection_status'] == 'Connected' and game_info['game_time'] <= 30:
+        
+        if (match_duration > 120 and  # Match running for at least 2 minutes
+            game_info['connection_status'] == 'Connected' and 
+            game_info['game_time'] <= 30 and 
+            game_info['game_time'] > 0):  # Make sure we have valid game time data
             logger.info("Game time ended, automatically stopping match")
             await auto_stop_match(clock, game_info)
             return
