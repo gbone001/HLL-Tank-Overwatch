@@ -40,6 +40,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 clocks = {}
 LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '0')) if os.getenv('LOG_CHANNEL_ID', '0').isdigit() else 0
+RESULTS_TARGET = None  # Will store channel/thread ID for results
 
 class APIKeyCRCONClient:
     """CRCON client using API key authentication"""
@@ -225,7 +226,12 @@ class ClockState:
     def get_current_elapsed(self):
         """Get elapsed time since last switch"""
         if self.last_switch and self.clock_started and self.active:
-            return (datetime.datetime.now(timezone.utc) - self.last_switch).total_seconds()
+            elapsed = (datetime.datetime.now(timezone.utc) - self.last_switch).total_seconds()
+            # Safeguard: If elapsed time is more than 24 hours, something went wrong
+            if elapsed > 86400:  # 24 hours in seconds
+                logger.error(f"Abnormal elapsed time detected: {elapsed} seconds. Resetting to 0.")
+                return 0
+            return max(0, elapsed)  # Ensure non-negative
         return 0
 
     def total_time(self, team):
@@ -234,14 +240,16 @@ class ClockState:
             base_time = self.time_a
             # Add current elapsed time if Allies are currently active
             if self.active == "A" and self.clock_started:
-                base_time += self.get_current_elapsed()
-            return base_time
+                current_elapsed = self.get_current_elapsed()
+                base_time += current_elapsed
+            return max(0, base_time)  # Ensure non-negative
         elif team == "B":
             base_time = self.time_b
             # Add current elapsed time if Axis are currently active
             if self.active == "B" and self.clock_started:
-                base_time += self.get_current_elapsed()
-            return base_time
+                current_elapsed = self.get_current_elapsed()
+                base_time += current_elapsed
+            return max(0, base_time)  # Ensure non-negative
         return 0
 
     def get_live_status(self, team):
@@ -358,12 +366,19 @@ class ClockState:
         now = datetime.datetime.now(timezone.utc)
         
         # IMPORTANT: Update accumulated time BEFORE switching
-        if self.active == "A" and self.last_switch:
+        if self.active and self.last_switch and self.clock_started:
             elapsed = (now - self.last_switch).total_seconds()
-            self.time_a += elapsed
-        elif self.active == "B" and self.last_switch:
-            elapsed = (now - self.last_switch).total_seconds()
-            self.time_b += elapsed
+            
+            # Safeguard: Don't allow negative or massive elapsed times
+            if elapsed < 0 or elapsed > 86400:  # More than 24 hours
+                logger.error(f"Invalid elapsed time: {elapsed} seconds. Not adding to totals.")
+            else:
+                if self.active == "A":
+                    self.time_a += elapsed
+                    logger.info(f"Added {elapsed:.1f}s to Allies. Total: {self.time_a:.1f}s")
+                elif self.active == "B":
+                    self.time_b += elapsed
+                    logger.info(f"Added {elapsed:.1f}s to Axis. Total: {self.time_b:.1f}s")
         
         # Record the switch
         switch_data = {
@@ -386,9 +401,9 @@ class ClockState:
         # Send notification to game (if messaging works)
         if self.crcon_client:
             team_name = "Allies" if team == "A" else "Axis"
-            # Get current control times for both teams
-            allies_time = self.format_time(self.total_time('A'))
-            axis_time = self.format_time(self.total_time('B'))
+            # Get current control times for both teams (but don't include current session)
+            allies_time = self.format_time(self.time_a)
+            axis_time = self.format_time(self.time_b)
             await self.crcon_client.send_message(f"🔄 {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}")
         
         # IMPORTANT: Update the Discord embed immediately
@@ -470,7 +485,15 @@ class ClockState:
         }
 
     def format_time(self, secs):
-        return str(datetime.timedelta(seconds=max(0, int(secs))))
+        """Format seconds into readable time, with safeguards"""
+        # Safeguard against massive time values
+        if secs > 86400:  # More than 24 hours
+            logger.warning(f"Abnormally large time value: {secs} seconds. Capping at 24 hours.")
+            secs = 86400
+        
+        # Ensure non-negative
+        secs = max(0, int(secs))
+        return str(datetime.timedelta(seconds=secs))
 
 def user_is_admin(interaction: discord.Interaction):
     admin_role = os.getenv('ADMIN_ROLE_NAME', 'admin').lower()
@@ -781,13 +804,20 @@ class TimerControls(discord.ui.View):
             clock.switches = [switch_data]
         else:
             # Subsequent switches - accumulate time properly
-            elapsed = (now - clock.last_switch).total_seconds()
-            
-            # Add elapsed time to the previously active team
-            if clock.active == "A":
-                clock.time_a += elapsed
-            elif clock.active == "B":
-                clock.time_b += elapsed
+            if clock.active and clock.last_switch:
+                elapsed = (now - clock.last_switch).total_seconds()
+                
+                # Safeguard: Don't allow negative or massive elapsed times
+                if elapsed < 0 or elapsed > 86400:  # More than 24 hours
+                    logger.error(f"Invalid elapsed time in manual switch: {elapsed} seconds. Not adding to totals.")
+                else:
+                    # Add elapsed time to the previously active team
+                    if clock.active == "A":
+                        clock.time_a += elapsed
+                        logger.info(f"Manual switch: Added {elapsed:.1f}s to Allies. Total: {clock.time_a:.1f}s")
+                    elif clock.active == "B":
+                        clock.time_b += elapsed
+                        logger.info(f"Manual switch: Added {elapsed:.1f}s to Axis. Total: {clock.time_b:.1f}s")
             
             # Switch to new team
             clock.active = team
@@ -797,9 +827,9 @@ class TimerControls(discord.ui.View):
         # Send notification
         if clock.crcon_client:
             team_name = "Allies" if team == "A" else "Axis"
-            # Get current control times for both teams
-            allies_time = clock.format_time(clock.total_time('A'))
-            axis_time = clock.format_time(clock.total_time('B'))
+            # Get current control times for both teams (but don't include current session)
+            allies_time = clock.format_time(clock.time_a)
+            axis_time = clock.format_time(clock.time_b)
             await clock.crcon_client.send_message(f"⚔️ {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}")
 
         await interaction.response.defer()
@@ -807,11 +837,17 @@ class TimerControls(discord.ui.View):
 
 async def log_results(clock: ClockState, game_info: dict):
     """Log match results focused on time control"""
-    if not LOG_CHANNEL_ID:
-        return
+    global RESULTS_TARGET
+    
+    # Use the configured target (thread or channel)
+    if RESULTS_TARGET:
+        target = bot.get_channel(RESULTS_TARGET)
+    elif LOG_CHANNEL_ID:
+        target = bot.get_channel(LOG_CHANNEL_ID)
+    else:
+        return  # No logging configured
         
-    results_channel = bot.get_channel(LOG_CHANNEL_ID)
-    if not results_channel:
+    if not target:
         return
     
     embed = discord.Embed(title="🏁 HLL Tank Overwatch Match Complete", color=0x800020)
@@ -838,7 +874,7 @@ async def log_results(clock: ClockState, game_info: dict):
     embed.add_field(name="🔄 Switches", value=str(len(clock.switches)), inline=True)
     embed.timestamp = datetime.datetime.now(timezone.utc)
     
-    await results_channel.send(embed=embed)
+    await target.send(embed=embed)
 
 # Update task - shows in-game time
 @tasks.loop(seconds=int(os.getenv('UPDATE_INTERVAL', '15')))
@@ -949,6 +985,26 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
         logger.error(f"Error in auto_stop_match: {e}")
 
 # Bot commands
+@bot.tree.command(name="setup_results", description="Configure where match results are posted")
+async def setup_results(interaction: discord.Interaction, 
+                       channel: discord.TextChannel = None, 
+                       thread: discord.Thread = None):
+    if not user_is_admin(interaction):
+        return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+    
+    # Store the choice globally (you could also use a simple file or database)
+    global RESULTS_TARGET
+    
+    if thread:
+        RESULTS_TARGET = thread.id
+        await interaction.response.send_message(f"✅ Match results will be posted to thread: {thread.name}", ephemeral=True)
+    elif channel:
+        RESULTS_TARGET = channel.id
+        await interaction.response.send_message(f"✅ Match results will be posted to channel: {channel.name}", ephemeral=True)
+    else:
+        RESULTS_TARGET = None
+        await interaction.response.send_message("✅ Match results posting disabled", ephemeral=True)
+
 @bot.tree.command(name="reverse_clock", description="Start the HLL Tank Overwatch time control clock")
 async def reverse_clock(interaction: discord.Interaction):
     channel_id = interaction.channel_id
@@ -1098,6 +1154,7 @@ async def help_clock(interaction: discord.Interaction):
         name="📋 Commands",
         value=(
             "`/reverse_clock` - Start a new time control clock\n"
+            "`/setup_results` - Choose where match results are posted\n"
             "`/crcon_status` - Check CRCON connection\n"
             "`/server_info` - Get current server info\n"
             "`/send_message` - Send message to server (admin)\n"
