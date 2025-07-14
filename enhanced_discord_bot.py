@@ -227,11 +227,11 @@ class ClockState:
         """Get elapsed time since last switch"""
         if self.last_switch and self.clock_started and self.active:
             elapsed = (datetime.datetime.now(timezone.utc) - self.last_switch).total_seconds()
-            # Safeguard: If elapsed time is more than 24 hours, something went wrong
-            if elapsed > 86400:  # 24 hours in seconds
+            # Only cap if it's truly abnormal (more than 4 hours in one session)
+            if elapsed > 14400:  # 4 hours
                 logger.error(f"Abnormal elapsed time detected: {elapsed} seconds. Resetting to 0.")
                 return 0
-            return max(0, elapsed)  # Ensure non-negative
+            return max(0, elapsed)
         return 0
 
     def total_time(self, team):
@@ -242,14 +242,14 @@ class ClockState:
             if self.active == "A" and self.clock_started:
                 current_elapsed = self.get_current_elapsed()
                 base_time += current_elapsed
-            return max(0, base_time)  # Ensure non-negative
+            return max(0, base_time)
         elif team == "B":
             base_time = self.time_b
             # Add current elapsed time if Axis are currently active
             if self.active == "B" and self.clock_started:
                 current_elapsed = self.get_current_elapsed()
                 base_time += current_elapsed
-            return max(0, base_time)  # Ensure non-negative
+            return max(0, base_time)
         return 0
 
     def get_live_status(self, team):
@@ -369,8 +369,8 @@ class ClockState:
         if self.active and self.last_switch and self.clock_started:
             elapsed = (now - self.last_switch).total_seconds()
             
-            # Safeguard: Don't allow negative or massive elapsed times
-            if elapsed < 0 or elapsed > 86400:  # More than 24 hours
+            # Safeguard: Don't allow negative or unrealistic elapsed times (more than 4 hours)
+            if elapsed < 0 or elapsed > 14400:  # More than 4 hours
                 logger.error(f"Invalid elapsed time: {elapsed} seconds. Not adding to totals.")
             else:
                 if self.active == "A":
@@ -401,9 +401,16 @@ class ClockState:
         # Send notification to game (if messaging works)
         if self.crcon_client:
             team_name = "Allies" if team == "A" else "Axis"
-            # Get current control times for both teams (but don't include current session)
-            allies_time = self.format_time(self.time_a)
-            axis_time = self.format_time(self.time_b)
+            # Get current control times for both teams with safeguards for messaging
+            allies_total = self.total_time('A')
+            axis_total = self.total_time('B')
+            
+            # Extra safeguard for game messages only - cap at 4 hours per team
+            allies_total = min(allies_total, 14400)  # 4 hours max
+            axis_total = min(axis_total, 14400)     # 4 hours max
+            
+            allies_time = self.format_time(allies_total)
+            axis_time = self.format_time(axis_total)
             await self.crcon_client.send_message(f"🔄 {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}")
         
         # IMPORTANT: Update the Discord embed immediately
@@ -485,13 +492,8 @@ class ClockState:
         }
 
     def format_time(self, secs):
-        """Format seconds into readable time, with safeguards"""
-        # Safeguard against massive time values
-        if secs > 86400:  # More than 24 hours
-            logger.warning(f"Abnormally large time value: {secs} seconds. Capping at 24 hours.")
-            secs = 86400
-        
-        # Ensure non-negative
+        """Format seconds into readable time"""
+        # Ensure non-negative and reasonable values
         secs = max(0, int(secs))
         return str(datetime.timedelta(seconds=secs))
 
@@ -807,8 +809,8 @@ class TimerControls(discord.ui.View):
             if clock.active and clock.last_switch:
                 elapsed = (now - clock.last_switch).total_seconds()
                 
-                # Safeguard: Don't allow negative or massive elapsed times
-                if elapsed < 0 or elapsed > 86400:  # More than 24 hours
+                # Safeguard: Don't allow negative or unrealistic elapsed times (more than 4 hours)
+                if elapsed < 0 or elapsed > 14400:  # More than 4 hours
                     logger.error(f"Invalid elapsed time in manual switch: {elapsed} seconds. Not adding to totals.")
                 else:
                     # Add elapsed time to the previously active team
@@ -827,9 +829,16 @@ class TimerControls(discord.ui.View):
         # Send notification
         if clock.crcon_client:
             team_name = "Allies" if team == "A" else "Axis"
-            # Get current control times for both teams (but don't include current session)
-            allies_time = clock.format_time(clock.time_a)
-            axis_time = clock.format_time(clock.time_b)
+            # Get current control times for both teams with safeguards for messaging
+            allies_total = clock.total_time('A')
+            axis_total = clock.total_time('B')
+            
+            # Extra safeguard for game messages only - cap at 4 hours per team
+            allies_total = min(allies_total, 14400)  # 4 hours max
+            axis_total = min(axis_total, 14400)     # 4 hours max
+            
+            allies_time = clock.format_time(allies_total)
+            axis_time = clock.format_time(axis_total)
             await clock.crcon_client.send_message(f"⚔️ {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}")
 
         await interaction.response.defer()
