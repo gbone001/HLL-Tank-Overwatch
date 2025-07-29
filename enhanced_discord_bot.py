@@ -202,7 +202,7 @@ class ClockState:
         self.active = None
         self.last_switch = None
         self.match_start_time = None
-        self.countdown_end = None  # Add this back
+        self.countdown_end = None
         self.message = None
         self.started = False
         self.clock_started = False
@@ -214,6 +214,19 @@ class ClockState:
         self.last_scores = {'allied': 0, 'axis': 0}
         self.switches = []
         self.last_update = None
+        
+        # Tank scoring system
+        self.tank_scores = {
+            'A': {'kills': 0, 'veteran_bonus': 0, 'ace_bonus': 0, 'mid_cap_time': 0, 'second_cap_time': 0, 'ironhide_bonus': 0},
+            'B': {'kills': 0, 'veteran_bonus': 0, 'ace_bonus': 0, 'mid_cap_time': 0, 'second_cap_time': 0, 'ironhide_bonus': 0}
+        }
+        self.tank_stats = {
+            'A': {'current_streak': 0, 'deaths': 0, 'longest_life_kills': 0, 'current_life_kills': 0, 'life_start': None},
+            'B': {'current_streak': 0, 'deaths': 0, 'longest_life_kills': 0, 'current_life_kills': 0, 'life_start': None}
+        }
+        self.cap_points = {'mid': None, 'second': None}
+        self.last_auto_switch = None
+        self.auto_switch_cooldown = 30  # 30 seconds between auto-switches
 
     def get_time_remaining(self):
         """Get time remaining in match"""
@@ -235,20 +248,20 @@ class ClockState:
         return 0
 
     def total_time(self, team):
-        """Get total time for a team INCLUDING current elapsed time"""
+        """Get total time for a team INCLUDING current elapsed time - FIXED VERSION"""
         if team == "A":
             base_time = self.time_a
             # Add current elapsed time if Allies are currently active
             if self.active == "A" and self.clock_started:
                 current_elapsed = self.get_current_elapsed()
-                base_time += current_elapsed
+                return max(0, base_time + current_elapsed)
             return max(0, base_time)
         elif team == "B":
             base_time = self.time_b
             # Add current elapsed time if Axis are currently active
             if self.active == "B" and self.clock_started:
                 current_elapsed = self.get_current_elapsed()
-                base_time += current_elapsed
+                return max(0, base_time + current_elapsed)
             return max(0, base_time)
         return 0
 
@@ -326,9 +339,15 @@ class ClockState:
             logger.error(f"Error updating from game: {e}")
     
     async def _check_score_changes(self):
-        """Check for captures to trigger auto-switch - focus on point control"""
+        """Check for captures with cooldown protection"""
         if not self.game_data or 'game_state' not in self.game_data:
             return
+        
+        # Add cooldown check
+        now = datetime.datetime.now(timezone.utc)
+        if (self.last_auto_switch and 
+            (now - self.last_auto_switch).total_seconds() < self.auto_switch_cooldown):
+            return  # Still in cooldown
         
         game_state = self.game_data['game_state']
         
@@ -347,9 +366,11 @@ class ClockState:
         
         # Check for score increases (point captures)
         if current_allied > self.last_scores['allied']:
+            self.last_auto_switch = now
             logger.info(f"Allied score increased! Switching to Allies")
             await self._auto_switch_to('A', "Allies captured the center point")
         elif current_axis > self.last_scores['axis']:
+            self.last_auto_switch = now
             logger.info(f"Axis score increased! Switching to Axis") 
             await self._auto_switch_to('B', "Axis captured the center point")
         else:
@@ -497,12 +518,130 @@ class ClockState:
         secs = max(0, int(secs))
         return str(datetime.timedelta(seconds=secs))
 
+    def calculate_tank_score(self, team):
+        """Calculate total tank score for a team"""
+        if team not in ['A', 'B']:
+            return 0
+            
+        scores = self.tank_scores[team]
+        total = 0
+        
+        # Tank kills: +10 pts each
+        total += scores['kills'] * 10
+        
+        # Veteran bonus: +15 pts (3+ kills, 0 deaths)
+        total += scores['veteran_bonus'] * 15
+        
+        # Ace bonus: +20 pts (5 kills in one life)
+        total += scores['ace_bonus'] * 20
+        
+        # Mid cap time: +1 pt/min
+        total += scores['mid_cap_time'] / 60  # Convert seconds to minutes
+        
+        # Second cap time: +1.5 pts/min  
+        total += (scores['second_cap_time'] / 60) * 1.5
+        
+        # Ironhide bonus: +10 pts (longest-living tank with kill)
+        total += scores['ironhide_bonus'] * 10
+        
+        return int(total)
+
+    def add_tank_kill(self, team):
+        """Add a tank kill for the specified team"""
+        if team not in ['A', 'B']:
+            return
+            
+        self.tank_scores[team]['kills'] += 1
+        self.tank_stats[team]['current_streak'] += 1
+        self.tank_stats[team]['current_life_kills'] += 1
+        
+        # Check for ace (5 kills in one life)
+        if self.tank_stats[team]['current_life_kills'] == 5:
+            self.tank_scores[team]['ace_bonus'] += 1
+            logger.info(f"Team {team} achieved ACE! (+20 pts)")
+        
+        # Update longest life record
+        if self.tank_stats[team]['current_life_kills'] > self.tank_stats[team]['longest_life_kills']:
+            self.tank_stats[team]['longest_life_kills'] = self.tank_stats[team]['current_life_kills']
+        
+        # Check for veteran status (3+ kills, 0 deaths in match)
+        if (self.tank_stats[team]['current_streak'] >= 3 and 
+            self.tank_stats[team]['deaths'] == 0):
+            # Only award veteran once per match
+            if self.tank_scores[team]['veteran_bonus'] == 0:
+                self.tank_scores[team]['veteran_bonus'] = 1
+                logger.info(f"Team {team} achieved VETERAN! (+15 pts)")
+
+    def add_tank_death(self, team):
+        """Add a tank death for the specified team"""
+        if team not in ['A', 'B']:
+            return
+            
+        self.tank_stats[team]['deaths'] += 1
+        self.tank_stats[team]['current_streak'] = 0
+        self.tank_stats[team]['current_life_kills'] = 0
+        
+        # Start new life timer
+        self.tank_stats[team]['life_start'] = datetime.datetime.now(timezone.utc)
+
+    def award_ironhide(self):
+        """Award ironhide bonus to team with longest-living tank that got a kill"""
+        longest_team = None
+        longest_kills = 0
+        
+        for team in ['A', 'B']:
+            if (self.tank_stats[team]['longest_life_kills'] > longest_kills and 
+                self.tank_stats[team]['longest_life_kills'] > 0):
+                longest_kills = self.tank_stats[team]['longest_life_kills']
+                longest_team = team
+        
+        if longest_team:
+            self.tank_scores[longest_team]['ironhide_bonus'] = 1
+            logger.info(f"Team {longest_team} awarded IRONHIDE! ({longest_kills} kills in one life)")
+            return longest_team
+        return None
+
+    def reset_tank_scores(self):
+        """Reset all tank scoring data"""
+        self.tank_scores = {
+            'A': {'kills': 0, 'veteran_bonus': 0, 'ace_bonus': 0, 'mid_cap_time': 0, 'second_cap_time': 0, 'ironhide_bonus': 0},
+            'B': {'kills': 0, 'veteran_bonus': 0, 'ace_bonus': 0, 'mid_cap_time': 0, 'second_cap_time': 0, 'ironhide_bonus': 0}
+        }
+        self.tank_stats = {
+            'A': {'current_streak': 0, 'deaths': 0, 'longest_life_kills': 0, 'current_life_kills': 0, 'life_start': None},
+            'B': {'current_streak': 0, 'deaths': 0, 'longest_life_kills': 0, 'current_life_kills': 0, 'life_start': None}
+        }
+        self.cap_points = {'mid': None, 'second': None}
+
+    def get_tank_scores(self):
+        """Get formatted tank scores for both teams"""
+        scores_a = self.tank_scores['A']
+        scores_b = self.tank_scores['B']
+        
+        # Format: "Team A: Kills, Deaths, Score | Team B: Kills, Deaths, Score"
+        return (f"🇺🇸 Allies: {scores_a['kills']} kills, {scores_a['deaths']} deaths, "
+                f"{self.calculate_tank_score('A')} pts | "
+                f"🇩🇪 Axis: {scores_b['kills']} kills, {scores_b['deaths']} deaths, "
+                f"{self.calculate_tank_score('B')} pts")
+
+    def get_tank_leaderboard(self):
+        """Get tank leaderboard based on scores"""
+        allies_score = self.calculate_tank_score('A')
+        axis_score = self.calculate_tank_score('B')
+        
+        if allies_score == axis_score:
+            return "🏆 **Current Leader: It's a tie!**"
+        elif allies_score > axis_score:
+            return "🏆 **Current Leader: Allies**"
+        else:
+            return "🏆 **Current Leader: Axis**"
+
 def user_is_admin(interaction: discord.Interaction):
     admin_role = os.getenv('ADMIN_ROLE_NAME', 'admin').lower()
     return any(role.name.lower() == admin_role for role in interaction.user.roles)
 
 def build_embed(clock: ClockState):
-    """Build Discord embed focused on TIME CONTROL"""
+    """Build Discord embed focused on TIME CONTROL and Tank Scoring"""
     embed = discord.Embed(
         title="🎯 🔥 HLL Tank Overwatch 🔥 🎯",
         description="**Control the center point to win!**",
@@ -523,9 +662,13 @@ def build_embed(clock: ClockState):
     allies_status = clock.get_live_status('A')
     axis_status = clock.get_live_status('B')
     
-    # Build team information focused on TIME CONTROL
-    allies_value = f"**Control Time:** `{clock.format_time(allies_status['total_time'])}`\n**Status:** {allies_status['status']}"
-    axis_value = f"**Control Time:** `{clock.format_time(axis_status['total_time'])}`\n**Status:** {axis_status['status']}"
+    # Calculate tank scores
+    allies_tank_score = clock.calculate_tank_score('A')
+    axis_tank_score = clock.calculate_tank_score('B')
+    
+    # Build team information focused on TIME CONTROL and Tank Performance
+    allies_value = f"**Control Time:** `{clock.format_time(allies_status['total_time'])}`\n**Status:** {allies_status['status']}\n**Tank Score:** `{allies_tank_score} pts`"
+    axis_value = f"**Control Time:** `{clock.format_time(axis_status['total_time'])}`\n**Status:** {axis_status['status']}\n**Tank Score:** `{axis_tank_score} pts`"
     
     # Add current session info for active team
     if allies_status['is_active'] and allies_status['current_session'] > 0:
@@ -543,21 +686,36 @@ def build_embed(clock: ClockState):
     embed.add_field(name="🇺🇸 Allies", value=allies_value, inline=False)
     embed.add_field(name="🇩🇪 Axis", value=axis_value, inline=False)
     
-    # Add current leader status
-    if allies_status['total_time'] > axis_status['total_time']:
+    # Add tank scoring breakdown
+    tank_scoring = (
+        "**Tank Scoring System:**\n"
+        "• Tank Kill: `+10 pts`\n"
+        "• Veteran (3+ kills, 0 deaths): `+15 pts`\n" 
+        "• Ace (5 kills in one life): `+20 pts`\n"
+        "• Hold Mid Cap: `+1 pt/min`\n"
+        "• Hold Second Cap: `+1.5 pts/min`\n"
+        "• Ironhide (Longest-Living Tank w/ Kill): `+10 pts`"
+    )
+    embed.add_field(name="🏆 Tank Scoring", value=tank_scoring, inline=False)
+    
+    # Add current leader status (combine time control and tank performance)
+    total_allies = allies_status['total_time'] + (allies_tank_score * 60)  # Convert tank points to seconds for comparison
+    total_axis = axis_status['total_time'] + (axis_tank_score * 60)
+    
+    if total_allies > total_axis:
         leader_text = "🏆 **Current Leader:** Allies"
-    elif axis_status['total_time'] > allies_status['total_time']:
+    elif total_axis > total_allies:
         leader_text = "🏆 **Current Leader:** Axis"
     else:
         leader_text = "⚖️ **Status:** Tied"
     
-    embed.add_field(name="🎯 Point Control", value=leader_text, inline=False)
+    embed.add_field(name="🎯 Overall Leader", value=leader_text, inline=False)
     
     # Footer with connection status
     connection_status = f"🟢 CRCON Connected" if clock.crcon_client else "🔴 CRCON Disconnected"
     auto_status = " | 🤖 Auto ON" if clock.auto_switch else " | 🤖 Auto OFF"
     
-    footer_text = f"Match Clock by {os.getenv('BOT_AUTHOR', 'StoneyRebel')} | {connection_status}{auto_status}"
+    footer_text = f"Tank Overwatch by {os.getenv('BOT_AUTHOR', 'StoneyRebel')} | {connection_status}{auto_status}"
     if game_info.get('last_update'):
         footer_text += f" | Updated: {game_info['last_update']}"
     
@@ -790,6 +948,11 @@ class TimerControls(discord.ui.View):
 
         clock = clocks[self.channel_id]
         now = datetime.datetime.now(timezone.utc)
+        
+        # Add manual switch cooldown (5 seconds)
+        if (clock.last_switch and 
+            (now - clock.last_switch).total_seconds() < 5):
+            return await interaction.response.send_message("⏱️ Please wait 5 seconds between switches.", ephemeral=True)
 
         switch_data = {
             'from_team': clock.active,
@@ -843,6 +1006,78 @@ class TimerControls(discord.ui.View):
 
         await interaction.response.defer()
         await clock.message.edit(embed=build_embed(clock), view=self)
+
+class TankScoringControls(discord.ui.View):
+    """Admin controls for tank scoring"""
+    
+    def __init__(self, channel_id):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="🎯 Tank Kill (A)", style=discord.ButtonStyle.success)
+    async def allies_kill(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_is_admin(interaction):
+            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+        
+        clock = clocks[self.channel_id]
+        clock.add_tank_kill('A')
+        
+        await interaction.response.defer()
+        await clock.message.edit(embed=build_embed(clock))
+        await interaction.followup.send("🎯 Allies tank kill recorded! (+10 pts)", ephemeral=True)
+
+    @discord.ui.button(label="🎯 Tank Kill (B)", style=discord.ButtonStyle.secondary)  
+    async def axis_kill(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_is_admin(interaction):
+            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+        
+        clock = clocks[self.channel_id]
+        clock.add_tank_kill('B')
+        
+        await interaction.response.defer()
+        await clock.message.edit(embed=build_embed(clock))
+        await interaction.followup.send("🎯 Axis tank kill recorded! (+10 pts)", ephemeral=True)
+
+    @discord.ui.button(label="💀 Death (A)", style=discord.ButtonStyle.danger)
+    async def allies_death(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_is_admin(interaction):
+            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+        
+        clock = clocks[self.channel_id]
+        clock.add_tank_death('A')
+        
+        await interaction.response.defer()
+        await clock.message.edit(embed=build_embed(clock))
+        await interaction.followup.send("💀 Allies tank death recorded", ephemeral=True)
+
+    @discord.ui.button(label="💀 Death (B)", style=discord.ButtonStyle.danger)
+    async def axis_death(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_is_admin(interaction):
+            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+        
+        clock = clocks[self.channel_id]
+        clock.add_tank_death('B')
+        
+        await interaction.response.defer()
+        await clock.message.edit(embed=build_embed(clock))
+        await interaction.followup.send("💀 Axis tank death recorded", ephemeral=True)
+
+    @discord.ui.button(label="🏆 Award Ironhide", style=discord.ButtonStyle.primary)
+    async def award_ironhide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_is_admin(interaction):
+            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+        
+        clock = clocks[self.channel_id]
+        winner = clock.award_ironhide()
+        
+        await interaction.response.defer()
+        await clock.message.edit(embed=build_embed(clock))
+        
+        if winner:
+            team_name = "Allies" if winner == "A" else "Axis"
+            await interaction.followup.send(f"🏆 Ironhide bonus awarded to {team_name}!", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ No eligible team for Ironhide bonus", ephemeral=True)
 
 async def log_results(clock: ClockState, game_info: dict):
     """Log match results focused on time control"""
