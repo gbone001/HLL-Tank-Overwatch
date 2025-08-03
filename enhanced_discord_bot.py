@@ -1028,8 +1028,8 @@ async def setup_results(interaction: discord.Interaction,
 @bot.tree.command(name="reverse_clock", description="Start the HLL Tank Overwatch time control clock")
 async def reverse_clock(interaction: discord.Interaction):
     try:
-        # Respond immediately to prevent timeout
-        await interaction.response.defer()
+        # Respond IMMEDIATELY to prevent timeout
+        await interaction.response.send_message("⏳ Creating clock...", ephemeral=True)
         
         channel_id = interaction.channel_id
         clocks[channel_id] = ClockState()
@@ -1037,22 +1037,29 @@ async def reverse_clock(interaction: discord.Interaction):
         embed = build_embed(clocks[channel_id])
         view = StartControls(channel_id)
 
-        await interaction.followup.send("✅ HLL Tank Overwatch clock ready!")
+        # Send the actual clock to the channel
         posted_message = await interaction.channel.send(embed=embed, view=view)
         clocks[channel_id].message = posted_message
+        
+        # Update the ephemeral message
+        await interaction.edit_original_response(content="✅ HLL Tank Overwatch clock ready!")
         
         logger.info(f"Clock created successfully by {interaction.user} in channel {channel_id}")
         
     except Exception as e:
         logger.error(f"Error in reverse_clock command: {e}")
         try:
-            await interaction.followup.send(f"❌ Error creating clock: {str(e)}")
+            await interaction.edit_original_response(content=f"❌ Error creating clock: {str(e)}")
         except:
-            pass
+            try:
+                await interaction.followup.send(f"❌ Error creating clock: {str(e)}", ephemeral=True)
+            except:
+                pass
 
 @bot.tree.command(name="crcon_status", description="Check CRCON connection status")
 async def crcon_status(interaction: discord.Interaction):
-    await interaction.response.defer()
+    # Respond immediately
+    await interaction.response.send_message("🔍 Checking CRCON status...", ephemeral=True)
     
     embed = discord.Embed(title="🔗 CRCON Status", color=0x0099ff)
     
@@ -1081,11 +1088,12 @@ async def crcon_status(interaction: discord.Interaction):
     embed.add_field(name="URL", value=os.getenv('CRCON_URL', 'Not set'), inline=True)
     embed.add_field(name="API Key", value=f"{os.getenv('CRCON_API_KEY', 'Not set')[:8]}..." if os.getenv('CRCON_API_KEY') else 'Not set', inline=True)
     
-    await interaction.followup.send(embed=embed)
+    await interaction.edit_original_response(content="", embed=embed)
 
 @bot.tree.command(name="server_info", description="Get current HLL server information")
 async def server_info(interaction: discord.Interaction):
-    await interaction.response.defer()
+    # Respond immediately
+    await interaction.response.send_message("🔍 Getting server info...", ephemeral=True)
     
     try:
         test_client = APIKeyCRCONClient()
@@ -1093,7 +1101,7 @@ async def server_info(interaction: discord.Interaction):
             live_data = await client.get_live_game_state()
             
             if not live_data:
-                return await interaction.followup.send("❌ Could not retrieve server information")
+                return await interaction.edit_original_response(content="❌ Could not retrieve server information")
             
             embed = discord.Embed(title="🎮 HLL Server Information", color=0x00ff00)
             
@@ -1118,14 +1126,15 @@ async def server_info(interaction: discord.Interaction):
                 embed.add_field(name="⏱️ Game Time", value=f"{time_remaining//60}:{time_remaining%60:02d}", inline=True)
             
             embed.timestamp = datetime.datetime.now(timezone.utc)
-            await interaction.followup.send(embed=embed)
+            await interaction.edit_original_response(content="", embed=embed)
             
     except Exception as e:
-        await interaction.followup.send(f"❌ Error retrieving server info: {str(e)}")
+        await interaction.edit_original_response(content=f"❌ Error retrieving server info: {str(e)}")
 
 @bot.tree.command(name="test_map", description="Quick map data test")
 async def test_map(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    # Respond immediately  
+    await interaction.response.send_message("🧪 Testing map data...", ephemeral=True)
     
     try:
         test_client = APIKeyCRCONClient()
@@ -1133,7 +1142,7 @@ async def test_map(interaction: discord.Interaction):
             live_data = await client.get_live_game_state()
             
             if not live_data:
-                return await interaction.followup.send("❌ No data")
+                return await interaction.edit_original_response(content="❌ No data")
             
             map_info = live_data.get('map_info', {})
             game_state = live_data.get('game_state', {})
@@ -1144,17 +1153,18 @@ async def test_map(interaction: discord.Interaction):
             if len(msg) > 1900:
                 msg = msg[:1900] + "..."
             
-            await interaction.followup.send(f"```\n{msg}\n```", ephemeral=True)
+            await interaction.edit_original_response(content=f"```\n{msg}\n```")
             
     except Exception as e:
-        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+        await interaction.edit_original_response(content=f"❌ Error: {str(e)}")
 
 @bot.tree.command(name="send_message", description="Send a message to the HLL server")
 async def send_server_message(interaction: discord.Interaction, message: str):
     if not user_is_admin(interaction):
         return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
     
-    await interaction.response.defer(ephemeral=True)
+    # Respond immediately
+    await interaction.response.send_message("📤 Sending message to server...", ephemeral=True)
     
     try:
         test_client = APIKeyCRCONClient()
@@ -1174,10 +1184,10 @@ async def send_server_message(interaction: discord.Interaction, message: str):
                     color=0xffaa00
                 )
             
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.edit_original_response(content="", embed=embed)
             
     except Exception as e:
-        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+        await interaction.edit_original_response(content=f"❌ Error: {str(e)}")
 
 @bot.tree.command(name="test_bot", description="Test if the bot is working correctly")
 async def test_bot(interaction: discord.Interaction):
