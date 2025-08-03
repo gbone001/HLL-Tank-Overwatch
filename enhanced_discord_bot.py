@@ -197,8 +197,8 @@ class ClockState:
     """Enhanced clock state with live updating team times"""
     
     def __init__(self):
-        self.time_a = 0
-        self.time_b = 0
+        self.time_a = 0.0  # Explicitly use floats
+        self.time_b = 0.0
         self.active = None
         self.last_switch = None
         self.match_start_time = None
@@ -214,6 +214,8 @@ class ClockState:
         self.last_scores = {'allied': 0, 'axis': 0}
         self.switches = []
         self.last_update = None
+        
+        logger.info("ClockState initialized with time_a=0.0, time_b=0.0")
 
     def get_time_remaining(self):
         """Get time remaining in match"""
@@ -401,16 +403,14 @@ class ClockState:
         # Send notification to game (if messaging works)
         if self.crcon_client:
             team_name = "Allies" if team == "A" else "Axis"
-            # Get current control times for both teams with safeguards for messaging
-            allies_total = self.total_time('A')
-            axis_total = self.total_time('B')
             
-            # Extra safeguard for game messages only - cap at 4 hours per team
-            allies_total = min(allies_total, 14400)  # 4 hours max
-            axis_total = min(axis_total, 14400)     # 4 hours max
+            # For game messages, use the accumulated times (not including current session)
+            # This prevents timing confusion during switches
+            allies_time = self.format_time(self.time_a)
+            axis_time = self.format_time(self.time_b)
             
-            allies_time = self.format_time(allies_total)
-            axis_time = self.format_time(axis_total)
+            logger.info(f"Sending game message - Allies: {self.time_a}s ({allies_time}), Axis: {self.time_b}s ({axis_time})")
+            
             await self.crcon_client.send_message(f"🔄 {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}")
         
         # IMPORTANT: Update the Discord embed immediately
@@ -493,8 +493,22 @@ class ClockState:
 
     def format_time(self, secs):
         """Format seconds into readable time"""
-        # Ensure non-negative and reasonable values
-        secs = max(0, int(secs))
+        # Handle None, negative, or invalid values
+        if secs is None or secs < 0:
+            return "0:00:00"
+        
+        # Ensure we have a valid number
+        try:
+            secs = int(secs)
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid time value for formatting: {secs}")
+            return "0:00:00"
+        
+        # Cap at reasonable maximum (24 hours)
+        if secs > 86400:
+            logger.warning(f"Capping large time value: {secs}s -> 24:00:00")
+            secs = 86400
+            
         return str(datetime.timedelta(seconds=secs))
 
 def user_is_admin(interaction: discord.Interaction):
@@ -829,16 +843,14 @@ class TimerControls(discord.ui.View):
         # Send notification
         if clock.crcon_client:
             team_name = "Allies" if team == "A" else "Axis"
-            # Get current control times for both teams with safeguards for messaging
-            allies_total = clock.total_time('A')
-            axis_total = clock.total_time('B')
             
-            # Extra safeguard for game messages only - cap at 4 hours per team
-            allies_total = min(allies_total, 14400)  # 4 hours max
-            axis_total = min(axis_total, 14400)     # 4 hours max
+            # For game messages, use the accumulated times (not including current session)
+            # This prevents timing confusion during switches  
+            allies_time = clock.format_time(clock.time_a)
+            axis_time = clock.format_time(clock.time_b)
             
-            allies_time = clock.format_time(allies_total)
-            axis_time = clock.format_time(axis_total)
+            logger.info(f"Manual switch - Sending game message - Allies: {clock.time_a}s ({allies_time}), Axis: {clock.time_b}s ({axis_time})")
+            
             await clock.crcon_client.send_message(f"⚔️ {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}")
 
         await interaction.response.defer()
@@ -1197,6 +1209,65 @@ async def test_bot(interaction: discord.Interaction):
     except Exception as e:
         logger.error(f"Error in test_bot command: {e}")
 
+@bot.tree.command(name="test_times", description="Test current time calculations (admin only)")
+async def test_times(interaction: discord.Interaction):
+    if not user_is_admin(interaction):
+        return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+    
+    await interaction.response.send_message("🧪 Testing time calculations...", ephemeral=True)
+    
+    # Find an active clock
+    active_clock = None
+    for clock in clocks.values():
+        if clock.started:
+            active_clock = clock
+            break
+    
+    if not active_clock:
+        return await interaction.edit_original_response(content="❌ No active match found. Start a match first with /reverse_clock")
+    
+    try:
+        # Get current times
+        allies_accumulated = active_clock.time_a
+        axis_accumulated = active_clock.time_b
+        allies_total = active_clock.total_time('A')
+        axis_total = active_clock.total_time('B')
+        current_elapsed = active_clock.get_current_elapsed()
+        
+        # Format times
+        allies_acc_formatted = active_clock.format_time(allies_accumulated)
+        axis_acc_formatted = active_clock.format_time(axis_accumulated) 
+        allies_total_formatted = active_clock.format_time(allies_total)
+        axis_total_formatted = active_clock.format_time(axis_total)
+        current_elapsed_formatted = active_clock.format_time(current_elapsed)
+        
+        debug_info = f"""**Time Debug Info:**
+
+**Accumulated Times:**
+• Allies: {allies_accumulated}s → {allies_acc_formatted}
+• Axis: {axis_accumulated}s → {axis_acc_formatted}
+
+**Total Times (with current session):**
+• Allies: {allies_total}s → {allies_total_formatted}  
+• Axis: {axis_total}s → {axis_total_formatted}
+
+**Current Session:**
+• Active Team: {active_clock.active or 'None'}
+• Session Time: {current_elapsed}s → {current_elapsed_formatted}
+• Clock Started: {active_clock.clock_started}
+
+**Game Message Would Show:**
+⚔️ Test captured the center point! | Allies: {allies_acc_formatted} | Axis: {axis_acc_formatted}"""
+
+        await interaction.edit_original_response(content=debug_info)
+        
+        # Also send a test message to the game server
+        if active_clock.crcon_client:
+            await active_clock.crcon_client.send_message(f"🧪 TEST MESSAGE | Allies: {allies_acc_formatted} | Axis: {axis_acc_formatted}")
+            
+    except Exception as e:
+        await interaction.edit_original_response(content=f"❌ Error testing times: {str(e)}")
+
 @bot.tree.command(name="help_clock", description="Show help for the time control clock")
 async def help_clock(interaction: discord.Interaction):
     embed = discord.Embed(title="🎯 HLL Tank Overwatch Clock Help", color=0x0099ff)
@@ -1207,6 +1278,7 @@ async def help_clock(interaction: discord.Interaction):
             "`/reverse_clock` - Start a new time control clock\n"
             "`/setup_results` - Choose where match results are posted\n"
             "`/test_bot` - Test if the bot is working\n"
+            "`/test_times` - Debug time calculations (admin)\n"
             "`/crcon_status` - Check CRCON connection\n"
             "`/server_info` - Get current server info\n"
             "`/send_message` - Send message to server (admin)\n"
@@ -1295,6 +1367,8 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         logger.info(f"✅ Synced {len(synced)} slash commands")
+        command_names = [cmd.name for cmd in synced]
+        logger.info(f"Commands: {', '.join(command_names)}")
         print(f"🎉 HLL Tank Overwatch Clock ready! Use /reverse_clock to start")
     except Exception as e:
         logger.error(f"❌ Command sync failed: {e}")
