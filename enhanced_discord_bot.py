@@ -529,20 +529,20 @@ class ClockState:
         # Tank kills: +10 pts each
         total += scores['kills'] * 10
         
-        # Veteran bonus: +15 pts (3+ kills, 0 deaths)
-        total += scores['veteran_bonus'] * 15
+        # Veteran bonus: +10 pts (3+ kills in 1 life, awarded once per crew per game)
+        total += scores['veteran_bonus'] * 10
         
-        # Ace bonus: +20 pts (5 kills in one life)
+        # Ace bonus: +20 pts (5 kills in one life, awarded once per crew per game)
         total += scores['ace_bonus'] * 20
         
         # Mid cap time: +1 pt/min
         total += scores['mid_cap_time'] / 60  # Convert seconds to minutes
         
-        # Second cap time: +1.5 pts/min  
+        # 4th cap time: +1.5 pts/min  
         total += (scores['second_cap_time'] / 60) * 1.5
         
-        # Ironhide bonus: +10 pts (longest-living tank with kill)
-        total += scores['ironhide_bonus'] * 10
+        # Ironhide bonus: +10 pts (longest-living tank with kill) - COMMENTED OUT
+        # total += scores['ironhide_bonus'] * 10
         
         return int(total)
 
@@ -564,13 +564,12 @@ class ClockState:
         if self.tank_stats[team]['current_life_kills'] > self.tank_stats[team]['longest_life_kills']:
             self.tank_stats[team]['longest_life_kills'] = self.tank_stats[team]['current_life_kills']
         
-        # Check for veteran status (3+ kills, 0 deaths in match)
-        if (self.tank_stats[team]['current_streak'] >= 3 and 
-            self.tank_stats[team]['deaths'] == 0):
-            # Only award veteran once per match
+        # Check for veteran status (3+ kills in 1 life, awarded once per crew per game)
+        if self.tank_stats[team]['current_life_kills'] >= 3:
+            # Only award veteran once per crew per game
             if self.tank_scores[team]['veteran_bonus'] == 0:
                 self.tank_scores[team]['veteran_bonus'] = 1
-                logger.info(f"Team {team} achieved VETERAN! (+15 pts)")
+                logger.info(f"Team {team} achieved VETERAN! (+10 pts)")
 
     def add_tank_death(self, team):
         """Add a tank death for the specified team"""
