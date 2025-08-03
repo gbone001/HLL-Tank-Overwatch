@@ -998,33 +998,57 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
 async def setup_results(interaction: discord.Interaction, 
                        channel: discord.TextChannel = None, 
                        thread: discord.Thread = None):
-    if not user_is_admin(interaction):
-        return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
-    
-    # Store the choice globally (you could also use a simple file or database)
-    global RESULTS_TARGET
-    
-    if thread:
-        RESULTS_TARGET = thread.id
-        await interaction.response.send_message(f"✅ Match results will be posted to thread: {thread.name}", ephemeral=True)
-    elif channel:
-        RESULTS_TARGET = channel.id
-        await interaction.response.send_message(f"✅ Match results will be posted to channel: {channel.name}", ephemeral=True)
-    else:
-        RESULTS_TARGET = None
-        await interaction.response.send_message("✅ Match results posting disabled", ephemeral=True)
+    try:
+        if not user_is_admin(interaction):
+            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+        
+        # Store the choice globally (you could also use a simple file or database)
+        global RESULTS_TARGET
+        
+        if thread:
+            RESULTS_TARGET = thread.id
+            await interaction.response.send_message(f"✅ Match results will be posted to thread: {thread.name}", ephemeral=True)
+            logger.info(f"Results target set to thread: {thread.name} ({thread.id}) by {interaction.user}")
+        elif channel:
+            RESULTS_TARGET = channel.id
+            await interaction.response.send_message(f"✅ Match results will be posted to channel: {channel.name}", ephemeral=True)
+            logger.info(f"Results target set to channel: {channel.name} ({channel.id}) by {interaction.user}")
+        else:
+            RESULTS_TARGET = None
+            await interaction.response.send_message("✅ Match results posting disabled", ephemeral=True)
+            logger.info(f"Results posting disabled by {interaction.user}")
+            
+    except Exception as e:
+        logger.error(f"Error in setup_results command: {e}")
+        try:
+            await interaction.response.send_message(f"❌ Error setting up results: {str(e)}", ephemeral=True)
+        except:
+            pass
 
 @bot.tree.command(name="reverse_clock", description="Start the HLL Tank Overwatch time control clock")
 async def reverse_clock(interaction: discord.Interaction):
-    channel_id = interaction.channel_id
-    clocks[channel_id] = ClockState()
+    try:
+        # Respond immediately to prevent timeout
+        await interaction.response.defer()
+        
+        channel_id = interaction.channel_id
+        clocks[channel_id] = ClockState()
 
-    embed = build_embed(clocks[channel_id])
-    view = StartControls(channel_id)
+        embed = build_embed(clocks[channel_id])
+        view = StartControls(channel_id)
 
-    await interaction.response.send_message("✅ HLL Tank Overwatch clock ready!", ephemeral=True)
-    posted_message = await interaction.channel.send(embed=embed, view=view)
-    clocks[channel_id].message = posted_message
+        await interaction.followup.send("✅ HLL Tank Overwatch clock ready!")
+        posted_message = await interaction.channel.send(embed=embed, view=view)
+        clocks[channel_id].message = posted_message
+        
+        logger.info(f"Clock created successfully by {interaction.user} in channel {channel_id}")
+        
+    except Exception as e:
+        logger.error(f"Error in reverse_clock command: {e}")
+        try:
+            await interaction.followup.send(f"❌ Error creating clock: {str(e)}")
+        except:
+            pass
 
 @bot.tree.command(name="crcon_status", description="Check CRCON connection status")
 async def crcon_status(interaction: discord.Interaction):
@@ -1155,6 +1179,14 @@ async def send_server_message(interaction: discord.Interaction, message: str):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
+@bot.tree.command(name="test_bot", description="Test if the bot is working correctly")
+async def test_bot(interaction: discord.Interaction):
+    try:
+        await interaction.response.send_message("✅ Bot is working! All systems operational.", ephemeral=True)
+        logger.info(f"Test command used successfully by {interaction.user}")
+    except Exception as e:
+        logger.error(f"Error in test_bot command: {e}")
+
 @bot.tree.command(name="help_clock", description="Show help for the time control clock")
 async def help_clock(interaction: discord.Interaction):
     embed = discord.Embed(title="🎯 HLL Tank Overwatch Clock Help", color=0x0099ff)
@@ -1164,6 +1196,7 @@ async def help_clock(interaction: discord.Interaction):
         value=(
             "`/reverse_clock` - Start a new time control clock\n"
             "`/setup_results` - Choose where match results are posted\n"
+            "`/test_bot` - Test if the bot is working\n"
             "`/crcon_status` - Check CRCON connection\n"
             "`/server_info` - Get current server info\n"
             "`/send_message` - Send message to server (admin)\n"
@@ -1220,13 +1253,15 @@ async def on_error(event, *args, **kwargs):
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
     error_msg = f"❌ Error: {str(error)}"
+    logger.error(f"Slash command error: {error} | Command: {interaction.command.name if interaction.command else 'Unknown'} | User: {interaction.user}")
+    
     try:
         if not interaction.response.is_done():
             await interaction.response.send_message(error_msg, ephemeral=True)
         else:
             await interaction.followup.send(error_msg, ephemeral=True)
-    except:
-        logger.error(f"Could not send error message: {error}")
+    except Exception as e:
+        logger.error(f"Could not send error message: {e}")
 
 @bot.event
 async def on_ready():
