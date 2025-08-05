@@ -1159,22 +1159,22 @@ class TankScoringControls(discord.ui.View):
         await clock.message.edit(embed=build_embed(clock))
         await interaction.followup.send("💀 Axis tank death recorded", ephemeral=True)
 
-    @discord.ui.button(label="🏆 Award Ironhide", style=discord.ButtonStyle.primary)
-    async def award_ironhide(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not user_is_admin(interaction):
-            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
-        
-        clock = clocks[self.channel_id]
-        winner = clock.award_ironhide()
-        
-        await interaction.response.defer()
-        await clock.message.edit(embed=build_embed(clock))
-        
-        if winner:
-            team_name = "Allies" if winner == "A" else "Axis"
-            await interaction.followup.send(f"🏆 Ironhide bonus awarded to {team_name}!", ephemeral=True)
-        else:
-            await interaction.followup.send("❌ No eligible team for Ironhide bonus", ephemeral=True)
+    # @discord.ui.button(label="🏆 Award Ironhide", style=discord.ButtonStyle.primary)
+    # async def award_ironhide(self, interaction: discord.Interaction, button: discord.ui.Button):
+    #     if not user_is_admin(interaction):
+    #         return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+    #     
+    #     clock = clocks[self.channel_id]
+    #     winner = clock.award_ironhide()
+    #     
+    #     await interaction.response.defer()
+    #     await clock.message.edit(embed=build_embed(clock))
+    #     
+    #     if winner:
+    #         team_name = "Allies" if winner == "A" else "Axis"
+    #         await interaction.followup.send(f"🏆 Ironhide bonus awarded to {team_name}!", ephemeral=True)
+    #     else:
+    #         await interaction.followup.send("❌ No eligible team for Ironhide bonus", ephemeral=True)
 
 async def log_results(clock: ClockState, game_info: dict):
     """Log match results focused on time control"""
