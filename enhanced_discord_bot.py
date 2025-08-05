@@ -635,6 +635,23 @@ class ClockState:
         else:
             return "🏆 **Current Leader: Axis**"
 
+    def update_cap_times(self):
+        """Update cap point time accumulation"""
+        if not self.active or not self.last_switch or not self.clock_started:
+            return
+        
+        current_time = datetime.datetime.now(timezone.utc)
+        elapsed = (current_time - self.last_switch).total_seconds()
+        
+        # Only add time if elapsed is reasonable (not negative, not more than update interval + buffer)
+        if 0 < elapsed < 60:  # Max 60 seconds since we update every 15 seconds
+            # For now, treat all control as "mid cap" - you can customize this logic
+            # based on your game mode requirements
+            if self.active == 'A':
+                self.tank_scores['A']['mid_cap_time'] += elapsed
+            elif self.active == 'B':
+                self.tank_scores['B']['mid_cap_time'] += elapsed
+
 def user_is_admin(interaction: discord.Interaction):
     admin_role = os.getenv('ADMIN_ROLE_NAME', 'admin').lower()
     return any(role.name.lower() == admin_role for role in interaction.user.roles)
@@ -689,11 +706,11 @@ def build_embed(clock: ClockState):
     tank_scoring = (
         "**Tank Scoring System:**\n"
         "• Tank Kill: `+10 pts`\n"
-        "• Veteran (3+ kills, 0 deaths): `+15 pts`\n" 
+        "• Veteran (3+ kills in 1 life): `+10 pts`\n" 
         "• Ace (5 kills in one life): `+20 pts`\n"
         "• Hold Mid Cap: `+1 pt/min`\n"
-        "• Hold Second Cap: `+1.5 pts/min`\n"
-        "• Ironhide (Longest-Living Tank w/ Kill): `+10 pts`"
+        "• Hold 4th Cap: `+1.5 pts/min`\n"
+        # "• Ironhide (Longest-Living Tank w/ Kill): `+10 pts`\n"  # COMMENTED OUT
     )
     embed.add_field(name="🏆 Tank Scoring", value=tank_scoring, inline=False)
     
@@ -860,6 +877,87 @@ class TimerControls(discord.ui.View):
             
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+    @discord.ui.button(label="🎯 Tank Scoring", style=discord.ButtonStyle.secondary)
+    async def tank_scoring(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_is_admin(interaction):
+            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+        
+        view = TankScoringControls(self.channel_id)
+        embed = discord.Embed(
+            title="🎯 Tank Scoring Controls",
+            description="Use these buttons to manually track tank kills and deaths",
+            color=0x800020
+        )
+        
+        clock = clocks[self.channel_id]
+        embed.add_field(
+            name="🇺🇸 Allies Tank Stats",
+            value=(
+                f"Kills: {clock.tank_scores['A']['kills']}\n"
+                f"Deaths: {clock.tank_stats['A']['deaths']}\n" 
+                f"Current Streak: {clock.tank_stats['A']['current_streak']}\n"
+                f"Longest Life: {clock.tank_stats['A']['longest_life_kills']} kills\n"
+                f"Score: {clock.calculate_tank_score('A')} pts"
+            ),
+            inline=True
+        )
+        
+        embed.add_field(
+            name="🇩🇪 Axis Tank Stats", 
+            value=(
+                f"Kills: {clock.tank_scores['B']['kills']}\n"
+                f"Deaths: {clock.tank_stats['B']['deaths']}\n"
+                f"Current Streak: {clock.tank_stats['B']['current_streak']}\n" 
+                f"Longest Life: {clock.tank_stats['B']['longest_life_kills']} kills\n"
+                f"Score: {clock.calculate_tank_score('B')} pts"
+            ),
+            inline=True
+        )
+        
+        # Add bonus status (without Ironhide)
+        bonuses_a = []
+        if clock.tank_scores['A']['veteran_bonus'] > 0:
+            bonuses_a.append("✅ Veteran")
+        if clock.tank_scores['A']['ace_bonus'] > 0:
+            bonuses_a.append(f"✅ Ace x{clock.tank_scores['A']['ace_bonus']}")
+            
+        bonuses_b = []
+        if clock.tank_scores['B']['veteran_bonus'] > 0:
+            bonuses_b.append("✅ Veteran")
+        if clock.tank_scores['B']['ace_bonus'] > 0:
+            bonuses_b.append(f"✅ Ace x{clock.tank_scores['B']['ace_bonus']}")
+        
+        embed.add_field(
+            name="🏆 Bonuses Earned",
+            value=(
+                f"**Allies:** {', '.join(bonuses_a) if bonuses_a else 'None'}\n"
+                f"**Axis:** {', '.join(bonuses_b) if bonuses_b else 'None'}"
+            ),
+            inline=False
+        )
+        
+        # Add detailed scoring breakdown
+        embed.add_field(
+            name="📊 Detailed Scores",
+            value=(
+                f"**Allies Total:** {clock.calculate_tank_score('A')} pts\n"
+                f"• Kills: {clock.tank_scores['A']['kills'] * 10} pts\n"
+                f"• Veteran: {clock.tank_scores['A']['veteran_bonus'] * 10} pts\n"
+                f"• Ace: {clock.tank_scores['A']['ace_bonus'] * 20} pts\n"
+                f"• Mid Cap: {int(clock.tank_scores['A']['mid_cap_time'] / 60)} pts\n"
+                f"• 4th Cap: {int((clock.tank_scores['A']['second_cap_time'] / 60) * 1.5)} pts\n\n"
+                f"**Axis Total:** {clock.calculate_tank_score('B')} pts\n"
+                f"• Kills: {clock.tank_scores['B']['kills'] * 10} pts\n"
+                f"• Veteran: {clock.tank_scores['B']['veteran_bonus'] * 10} pts\n"
+                f"• Ace: {clock.tank_scores['B']['ace_bonus'] * 20} pts\n"
+                f"• Mid Cap: {int(clock.tank_scores['B']['mid_cap_time'] / 60)} pts\n"
+                f"• 4th Cap: {int((clock.tank_scores['B']['second_cap_time'] / 60) * 1.5)} pts"
+            ),
+            inline=False
+        )
+        
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="↺ Reset", style=discord.ButtonStyle.primary)
     async def reset_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
