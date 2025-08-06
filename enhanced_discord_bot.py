@@ -1226,6 +1226,9 @@ async def match_updater(channel_id):
         return
 
     try:
+        # Update cap times for the currently active team
+        clock.update_cap_times()
+        
         # Update from CRCON if connected
         if clock.crcon_client:
             try:
@@ -1539,6 +1542,49 @@ async def help_clock(interaction: discord.Interaction):
     embed.add_field(
         name="👑 Admin Requirements",
         value="You need the **Admin** role to control the clock.",
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="tank_help", description="Show tank scoring system help")
+async def tank_help(interaction: discord.Interaction):
+    embed = discord.Embed(title="🎯 Tank Scoring System", color=0x800020)
+    
+    embed.add_field(
+        name="📊 Scoring Breakdown",
+        value=(
+            "**Tank Kill:** +10 pts\n"
+            "**Veteran** (3+ kills in 1 life): +10 pts\n"
+            "**Ace** (5 kills in one life): +20 pts\n"
+            "**Hold Mid Cap:** +1 pt per minute\n"
+            "**Hold 4th Cap:** +1.5 pts per minute\n"
+            # "**Ironhide** (Longest-Living Tank w/ Kill): +10 pts"  # COMMENTED OUT
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🏆 How It Works",
+        value=(
+            "• **Tank Kills** are manually tracked by admins\n"
+            "• **Veteran** is awarded once per crew per game for 3+ kills in 1 life\n"
+            "• **Ace** is awarded once per crew per game for 5 kills in one life\n"
+            "• **Cap bonuses** accumulate automatically while holding points\n"
+            # "• **Ironhide** is awarded at match end to the longest-surviving tank with kills"  # COMMENTED OUT
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚙️ Admin Controls",
+        value=(
+            "Admins can use the **🎯 Tank Scoring** button to:\n"
+            "• Record tank kills for each team\n"
+            "• Record tank deaths (resets kill streak)\n"
+            # "• Manually award Ironhide bonus\n"  # COMMENTED OUT
+            "• View detailed tank statistics and breakdowns"
+        ),
         inline=False
     )
     
