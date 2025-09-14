@@ -1,3 +1,7 @@
 discord.py>=2.3.0
 aiohttp>=3.8.0
 python-dotenv>=1.0.0
+# for webhook + model validation
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.2
