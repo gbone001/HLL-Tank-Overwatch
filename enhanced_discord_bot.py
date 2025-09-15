@@ -1571,36 +1571,19 @@ if __name__ == "__main__":
     
     # Check for Discord token
     token = os.getenv("DISCORD_TOKEN")
-    if not token or token == "your_discord_bot_token_here":
-        print("❌ DISCORD_TOKEN not configured!")
-        print("1. Create a Discord bot at https://discord.com/developers/applications")
-        print("2. Copy the bot token")
-        print("3. Edit .env file and set DISCORD_TOKEN=your_actual_token")
-        exit(1)
-    
-    # Check for API key
     api_key = os.getenv("CRCON_API_KEY")
-    if not api_key or api_key == "your_crcon_api_key_here":
-        print("❌ CRCON_API_KEY not configured!")
-        print("Edit .env file and set CRCON_API_KEY=your_crcon_api_key_here")
-        exit(1)
-    
-    # Show configuration
-    print(f"🔗 CRCON: {os.getenv('CRCON_URL', 'http://localhost:8010')}")
-    print(f"🔑 API Key: {api_key[:8]}...")
+    # Show configuration (no secrets printed)
+    print(f"🔗 CRCON: {os.getenv('CRCON_URL', '')}")
     print(f"👑 Admin Role: {os.getenv('ADMIN_ROLE_NAME', 'admin')}")
     print(f"🤖 Bot Name: {os.getenv('BOT_NAME', 'HLLTankBot')}")
     print(f"⏱️ Update Interval: {os.getenv('UPDATE_INTERVAL', '15')}s")
     print(f"🔄 Auto-Switch: {os.getenv('CRCON_AUTO_SWITCH', 'true')}")
-    
     log_channel = os.getenv('LOG_CHANNEL_ID', '0')
     if log_channel != '0':
         print(f"📋 Log Channel: {log_channel}")
     else:
         print("📋 Log Channel: Disabled")
-    
     print("🎯 Focus: TIME CONTROL - Win by holding the center point longest!")
-    
     try:
         bot.run(token)
     except Exception as e:
