@@ -84,16 +84,18 @@ async def poll_crcon_sectors():
         print("[TankScore] CRCON poll error:", e)
 
 def start_webhook_if_enabled():
-    host = os.getenv("HLU_WEBHOOK_BIND", "")
-    port_str = os.getenv("HLU_WEBHOOK_PORT", "")
+    # On Railway, PORT is provided; default bind to 0.0.0.0 there
+    railway = os.getenv("RAILWAY_ENVIRONMENT") is not None or os.getenv("PORT")
+    host = os.getenv("HLU_WEBHOOK_BIND", "0.0.0.0" if railway else "")
+    port_str = os.getenv("PORT") or os.getenv("HLU_WEBHOOK_PORT", "")
     if not host or not port_str:
-        print("[tankscore] Webhook disabled (set HLU_WEBHOOK_BIND/HLU_WEBHOOK_PORT to enable).")
+        print("[tankscore] Webhook disabled (set HLU_WEBHOOK_BIND/HLU_WEBHOOK_PORT or provide PORT).")
         return
 
     try:
-        port = int(port_str)
+        port = int(str(port_str))
     except ValueError:
-        print(f"[tankscore] Invalid HLU_WEBHOOK_PORT={port_str!r}")
+        print(f"[tankscore] Invalid webhook port value={port_str!r}")
         return
 
     def _run():
@@ -1595,7 +1597,6 @@ async def tick_scores():
     # Add per-second mid / >=4 sectors points
     engine.tick()
 
-    # If you maintain a live “status” message or embed, update it here
+    # If you maintain a live "status" message or embed, update it here
     # Example:
     # await update_status_embed()
-git filter-repo --path .env.template --invert-paths
