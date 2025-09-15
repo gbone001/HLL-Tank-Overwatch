@@ -1598,3 +1598,4 @@ async def tick_scores():
     # If you maintain a live “status” message or embed, update it here
     # Example:
     # await update_status_embed()
+git filter-repo --path .env.template --invert-paths
