@@ -16,6 +16,13 @@ from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from discord import app_commands
 from datetime import timezone, timedelta
+import os
+import threading
+import uvicorn
+from discord.ext import tasks
+
+from tankscore.score_engine import ScoreEngine
+from tankscore.webhook_server import app as webhook_app, ENGINE as WEBHOOK_ENGINE
 
 # Set up logging
 logging.basicConfig(
@@ -41,6 +48,27 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 clocks = {}
 LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '0')) if os.getenv('LOG_CHANNEL_ID', '0').isdigit() else 0
 RESULTS_TARGET = None  # Will store channel/thread ID for results
+
+def start_webhook_if_enabled():
+    host = os.getenv("HLU_WEBHOOK_BIND", "")
+    port_str = os.getenv("HLU_WEBHOOK_PORT", "")
+    if not host or not port_str:
+        print("[tankscore] Webhook disabled (set HLU_WEBHOOK_BIND/HLU_WEBHOOK_PORT to enable).")
+        return
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        print(f"[tankscore] Invalid HLU_WEBHOOK_PORT={port_str!r}")
+        return
+
+    def _run():
+        # FastAPI served by uvicorn in a daemon thread
+        uvicorn.run(webhook_app, host=host, port=port, log_level="info")
+
+    t = threading.Thread(target=_run, name="TankScoreWebhook", daemon=True)
+    t.start()
+    print(f"[tankscore] Webhook listening at http://{host}:{port}/event")
 
 class APIKeyCRCONClient:
     """CRCON client using API key authentication"""
@@ -399,6 +427,15 @@ class ClockState:
         # Start the clock if this is the first switch
         if not self.clock_started:
             self.clock_started = True
+
+        # Hook sector ownership updates to the engine
+        # engine is the shared ScoreEngine instance
+        if team == "A":
+            engine.set_sector_owner(sector_id=3, new_team="ALLIES")
+        elif team == "B":
+            engine.set_sector_owner(sector_id=3, new_team="AXIS")
+        else:
+            engine.set_sector_owner(sector_id=3, new_team=None)
         
         # Send notification to game (if messaging works)
         if self.crcon_client:
@@ -1345,6 +1382,43 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
     except Exception as e:
         logger.error(f"Could not send error message: {e}")
 
+# Create the shared scoring engine and expose it to the webhook server
+engine = ScoreEngine()
+WEBHOOK_ENGINE = engine  # makes the engine available inside the FastAPI app
+
+# --- TankScore Slash Commands ---
+@bot.tree.command(name="tankscore_status", description="Show live tank scoring totals")
+async def tankscore_status(interaction: discord.Interaction):
+    phase1, phase2, kbc = engine.totals()  # phase1 are floats, phase2 are ints
+    def fmt(d): return ", ".join(f"{k}:{v}" for k, v in d.items()) if d else "—"
+    msg = (
+        f"**Phase 1 (Mid + ≥4 sectors)**\n"
+        f"ALLIES: {phase1['ALLIES']} | AXIS: {phase1['AXIS']}\n\n"
+        f"**Phase 2 (Tank points)**\n"
+        f"ALLIES: {phase2['ALLIES']} | AXIS: {phase2['AXIS']}\n\n"
+        f"**Kills by class**\n"
+        f"ALLIES: {fmt(kbc['ALLIES'])}\n"
+        f"AXIS:   {fmt(kbc['AXIS'])}"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@bot.tree.command(name="tankscore_end", description="Compute end-of-match awards and show totals")
+async def tankscore_end(interaction: discord.Interaction):
+    awards, details = engine.compute_awards()
+    phase1, phase2, _ = engine.totals()
+    def total(team):
+        return round(phase1[team], 2) + phase2[team] + awards[team]
+    msg = (
+        f"**Awards** (Veteran +{engine.vet_pts}, Ace +{engine.ace_pts}, IRONHIDE +{engine.ironhide_pts})\n"
+        f"Veteran squads: {details['veteran'] or '—'}\n"
+        f"Ace squads:     {details['ace'] or '—'}\n"
+        f"IRONHIDE:       {details['ironhide'] or '—'}\n\n"
+        f"**Totals**\n"
+        f"ALLIES → Phase1={round(phase1['ALLIES'],2)}  Phase2={phase2['ALLIES']}  Awards={awards['ALLIES']}  = **{total('ALLIES')}**\n"
+        f"AXIS    → Phase1={round(phase1['AXIS'],2)}    Phase2={phase2['AXIS']}    Awards={awards['AXIS']}    = **{total('AXIS')}**"
+    )
+    await interaction.response.send_message(msg)
+
 @bot.event
 async def on_ready():
     logger.info(f"✅ Bot logged in as {bot.user}")
@@ -1372,6 +1446,15 @@ async def on_ready():
         print(f"🎉 HLL Tank Overwatch Clock ready! Use /reverse_clock to start")
     except Exception as e:
         logger.error(f"❌ Command sync failed: {e}")
+    
+    print(f"Logged in as {bot.user}")
+    start_webhook_if_enabled()
+    tick_scores.start()     # (we’ll add this task below)
+    # If you use app commands (slash), ensure the tree syncs:
+    try:
+        await bot.tree.sync()
+    except Exception as e:
+        print("[tankscore] slash command sync failed:", e)
 
 # Main execution
 if __name__ == "__main__":
@@ -1414,3 +1497,12 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
         print(f"❌ Bot startup failed: {e}")
+
+@tasks.loop(seconds=1.0)
+async def tick_scores():
+    # Add per-second mid / >=4 sectors points
+    engine.tick()
+
+    # If you maintain a live “status” message or embed, update it here
+    # Example:
+    # await update_status_embed()
