@@ -1,0 +1,406 @@
+*** a/requirements.txt
+--- b/requirements.txt
+@@
+ discord.py>=2.3.2
+ python-dotenv>=1.0.1
+ fastapi>=0.115.0
+ uvicorn[standard]>=0.30.0
+ pydantic>=2.8.2
++PyYAML>=6.0.1
+
+*** /dev/null
+--- b/tankscore/vehicles.yml
+@@
++# Axis
++"Tiger I": HEAVY
++"Panther": MEDIUM
++"Panzer IV": MEDIUM
++"StuG III": TD
++
++# Allies
++"Sherman 75": MEDIUM
++"Sherman 76": MEDIUM
++"Jumbo 75": HEAVY
++"Jumbo 76": HEAVY
++"Greyhound": LIGHT
++"Stuart": LIGHT
+
+*** /dev/null
+--- b/tankscore/vehicle_map.py
+@@
++from __future__ import annotations
++import os
++from typing import Optional, Dict
++import yaml
++
++_MAP: Optional[Dict[str, str]] = None
++
++def load_vehicle_map() -> Dict[str, str]:
++    global _MAP
++    if _MAP is not None:
++        return _MAP
++    path_candidates = [
++        os.path.join(os.getcwd(), "tankscore", "vehicles.yml"),
++        os.path.join(os.path.dirname(__file__), "vehicles.yml"),
++    ]
++    data: Dict[str, str] = {}
++    for p in path_candidates:
++        if os.path.exists(p):
++            with open(p, "r", encoding="utf-8") as f:
++                loaded = yaml.safe_load(f) or {}
++                if isinstance(loaded, dict):
++                    data.update({str(k): str(v) for k, v in loaded.items()})
++            break
++    _MAP = data
++    return _MAP
++
++def classify_by_name(name: str) -> Optional[str]:
++    return load_vehicle_map().get(name)
+
+*** /dev/null
+--- b/tankscore/store.py
+@@
++from __future__ import annotations
++import json, os, time
++from typing import Any, Dict
++
++DATA_DIR = os.environ.get("TANKSCORE_DATA_DIR", "data")
++os.makedirs(DATA_DIR, exist_ok=True)
++
++def now_ts() -> str:
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++
++def append_jsonl(filename: str, obj: Dict[str, Any]) -> None:
++    path = os.path.join(DATA_DIR, filename)
++    with open(path, "a", encoding="utf-8") as f:
++        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+*** /dev/null
+--- b/tankscore/export_csv.py
+@@
++from __future__ import annotations
++import csv, os
++from typing import List, Dict, Any
++
++DATA_DIR = os.environ.get("TANKSCORE_DATA_DIR", "data")
++os.makedirs(DATA_DIR, exist_ok=True)
++
++def write_scoreboard_csv(match_id: str, rows: List[Dict[str, Any]]) -> str:
++    path = os.path.join(DATA_DIR, f"scoreboard_{match_id}.csv")
++    fields = sorted(rows[0].keys()) if rows else ["team","phase1","phase2","awards","total"]
++    with open(path, "w", newline="", encoding="utf-8") as f:
++        w = csv.DictWriter(f, fieldnames=fields)
++        w.writeheader()
++        for r in rows:
++            w.writerow(r)
++    return path
+
+*** /dev/null
+--- b/tankscore/discord_ui.py
+@@
++from __future__ import annotations
++import time
++import discord
++from discord import app_commands
++from typing import Dict
++
++def format_kills_by_class(kbc_team: Dict[str,int]) -> str:
++    order = ["LIGHT","MEDIUM","HEAVY","TD"]
++    return " ".join(f"{k[0]}:{int(kbc_team.get(k,0))}" for k in order)
++
++def register_slash_commands(bot, engine):
++    @bot.tree.command(name="tankscore_status", description="Show current tank scoring totals")
++    async def tankscore_status(interaction: discord.Interaction):
++        phase1, phase2, kbc = engine.totals()
++        embed = discord.Embed(
++            title="🔧 Tank Score — Live",
++            description="Phase 1: Mid & ≥4 sectors per-minute accrual\nPhase 2: Tank kills",
++            color=0x2b6cb0
++        )
++        embed.add_field(name="Phase 1 — Mid+4th",
++                        value=f"**ALLIES:** {phase1['ALLIES']:.2f}\n**AXIS:** {phase1['AXIS']:.2f}",
++                        inline=True)
++        embed.add_field(name="Phase 2 — Tank points",
++                        value=f"**ALLIES:** {phase2['ALLIES']}\n**AXIS:** {phase2['AXIS']}",
++                        inline=True)
++        embed.add_field(name="Per-class (L/M/H/TD)",
++                        value=(f"**ALLIES:** {format_kills_by_class(kbc['ALLIES'])}\n"
++                               f"**AXIS:** {format_kills_by_class(kbc['AXIS'])}"),
++                        inline=False)
++        await interaction.response.send_message(embed=embed, ephemeral=True)
++
++    @bot.tree.command(name="tankscore_end", description="End match, compute awards, show final totals, and export CSV")
++    async def tankscore_end(interaction: discord.Interaction):
++        await interaction.response.defer()
++        awards, details = engine.compute_awards()
++        phase1, phase2, _ = engine.totals()
++        total = {
++            "ALLIES": round(phase1["ALLIES"], 2) + phase2["ALLIES"] + awards["ALLIES"],
++            "AXIS":   round(phase1["AXIS"], 2)   + phase2["AXIS"]   + awards["AXIS"],
++        }
++        def fmt_list(xs):
++            return ", ".join([f"{t}/{s}" for (t, s) in xs]) if xs else "(none)"
++        ironhide = (f"{details['ironhide'][0]}/{details['ironhide'][1]}"
++                    if details["ironhide"] else "(none)")
++        winner = "Tie"
++        if total["ALLIES"] > total["AXIS"]:
++            winner = "ALLIES"
++        elif total["AXIS"] > total["ALLIES"]:
++            winner = "AXIS"
++        embed = discord.Embed(
++            title="🏁 Tank Score — Final",
++            description=f"Winner: **{winner}**",
++            color=0x38a169
++        )
++        embed.add_field(name="Phase 1 — Mid+4th",
++                        value=f"ALLIES: {phase1['ALLIES']:.2f}\nAXIS: {phase1['AXIS']:.2f}",
++                        inline=True)
++        embed.add_field(name="Phase 2 — Tank points",
++                        value=f"ALLIES: {phase2['ALLIES']}\nAXIS: {phase2['AXIS']}",
++                        inline=True)
++        embed.add_field(name=f"Awards (Vet +{engine.vet_pts}, Ace +{engine.ace_pts}, IRONHIDE +{engine.ironhide_pts})",
++                        value=(f"Veteran: {fmt_list(details['veteran'])}\n"
++                               f"Ace: {fmt_list(details['ace'])}\n"
++                               f"IRONHIDE: {ironhide}"),
++                        inline=False)
++        embed.add_field(name="Totals",
++                        value=(f"ALLIES: {round(phase1['ALLIES'],2)} + {phase2['ALLIES']} + {awards['ALLIES']} "
++                               f"= **{total['ALLIES']}**\n"
++                               f"AXIS:   {round(phase1['AXIS'],2)} + {phase2['AXIS']} + {awards['AXIS']} "
++                               f"= **{total['AXIS']}**"),
++                        inline=False)
++        await interaction.followup.send(embed=embed)
++
++        # CSV export
++        import time as _time
++        from .export_csv import write_scoreboard_csv
++        match_id = _time.strftime("%Y%m%d-%H%M%S")
++        rows = [
++            {"team":"ALLIES","phase1":round(phase1["ALLIES"],2),"phase2":phase2["ALLIES"],
++             "awards":awards["ALLIES"],"total":total["ALLIES"]},
++            {"team":"AXIS","phase1":round(phase1["AXIS"],2),"phase2":phase2["AXIS"],
++             "awards":awards["AXIS"],"total":total["AXIS"]},
++        ]
++        csv_path = write_scoreboard_csv(match_id, rows)
++        await interaction.followup.send(file=discord.File(csv_path))
+
+*** a/tankscore/webhook_server.py
+--- b/tankscore/webhook_server.py
+@@
+-from __future__ import annotations
+-import hmac, hashlib, os, typing as T
+-from fastapi import FastAPI, Request, HTTPException
+-from pydantic import BaseModel, Field
+-from .score_engine import ScoreEngine, Team, VehicleClass
+-
+-app = FastAPI()
+-ENGINE: ScoreEngine | None = None  # set by caller
+-SECRET = os.getenv("HLU_WEBHOOK_SHARED_SECRET","").encode()
+-
+-class Killer(BaseModel):
+-    name: str
+-    steam_id: str
+-    team: Team
+-    squad_id: str | None = None
+-
+-class VictimVehicle(BaseModel):
+-    side: Team
+-    class_: VehicleClass = Field(alias="class")
+-    name: str
+-
+-class VehicleDestroyed(BaseModel):
+-    type: T.Literal["vehicle_destroyed"]
+-    timestamp: str
+-    killer: Killer
+-    victim_vehicle: VictimVehicle
+-    map: str | None = None
+-    match_id: str | None = None
+-
+-class PlayerDeath(BaseModel):
+-    type: T.Literal["player_death"]
+-    timestamp: str
+-    team: Team
+-    squad_id: str | None = None
+-
+-def _verify(req_body: bytes, signature: str | None):
+-    if not SECRET:
+-        return
+-    if not signature:
+-        raise HTTPException(401, "missing signature")
+-    mac = hmac.new(SECRET, req_body, hashlib.sha256).hexdigest()
+-    if not hmac.compare_digest(mac, signature):
+-        raise HTTPException(401, "bad signature")
+-
+-@app.post("/event")
+-async def event(request: Request):
+-    raw = await request.body()
+-    _verify(raw, request.headers.get("X-HLU-Signature"))
+-    data = await request.json()
+-    global ENGINE
+-    if ENGINE is None:
+-        raise HTTPException(503, "engine not ready")
+-
+-    t = data.get("type")
+-    if t == "vehicle_destroyed":
+-        evt = VehicleDestroyed.model_validate(data)
+-        # Phase 2: killer's team gets tank points; track class
+-        ENGINE.on_tank_kill(evt.killer.team, evt.victim_vehicle.class_)
+-        # Phase 3: if killer is in an Armor squad (squad_id provided), increment streak
+-        if evt.killer.squad_id:
+-            ENGINE.on_squad_tank_kill(evt.killer.team, evt.killer.squad_id)
+-        return {"ok": True}
+-    elif t == "player_death":
+-        evt = PlayerDeath.model_validate(data)
+-        if evt.squad_id:
+-            ENGINE.on_squad_member_death(evt.team, evt.squad_id)
+-        return {"ok": True}
+-    else:
+-        return {"ignored": t}
++from __future__ import annotations
++import hmac, hashlib, os, typing as T
++from fastapi import FastAPI, Request, HTTPException
++from pydantic import BaseModel, Field
++from .score_engine import ScoreEngine, Team, VehicleClass
++from .vehicle_map import classify_by_name
++from .store import append_jsonl, now_ts
++
++app = FastAPI()
++ENGINE: ScoreEngine | None = None  # set by caller
++SECRET = os.getenv("HLU_WEBHOOK_SHARED_SECRET","").encode()
++
++# ---- Pydantic v1/v2 compat ----
++def _validate(model_cls, data: dict):
++    if hasattr(model_cls, "model_validate"):
++        return model_cls.model_validate(data)   # v2
++    return model_cls.parse_obj(data)            # v1
++
++class Killer(BaseModel):
++    name: str
++    steam_id: str
++    team: Team
++    squad_id: str | None = None
++
++class VictimVehicle(BaseModel):
++    side: Team
++    class_: VehicleClass | None = Field(default=None, alias="class")
++    name: str
++
++class VehicleDestroyed(BaseModel):
++    type: T.Literal["vehicle_destroyed"]
++    timestamp: str
++    killer: Killer
++    victim_vehicle: VictimVehicle
++    map: str | None = None
++    match_id: str | None = None
++
++class PlayerDeath(BaseModel):
++    type: T.Literal["player_death"]
++    timestamp: str
++    team: Team
++    squad_id: str | None = None
++
++def _verify(req_body: bytes, signature: str | None):
++    if not SECRET:
++        return
++    if not signature:
++        raise HTTPException(401, "missing signature")
++    mac = hmac.new(SECRET, req_body, hashlib.sha256).hexdigest()
++    if not hmac.compare_digest(mac, signature):
++        raise HTTPException(401, "bad signature")
++
++@app.post("/event")
++async def event(request: Request):
++    raw = await request.body()
++    _verify(raw, request.headers.get("X-HLU-Signature"))
++    data = await request.json()
++    if ENGINE is None:
++        raise HTTPException(503, "engine not ready")
++
++    t = data.get("type")
++    if t == "vehicle_destroyed":
++        evt = _validate(VehicleDestroyed, data)
++        # Class fallback via vehicle name if class missing/None
++        victim_cls = evt.victim_vehicle.class_ or classify_by_name(evt.victim_vehicle.name) or "MEDIUM"
++        # Phase 2 score + Phase 3 streak
++        ENGINE.on_tank_kill(evt.killer.team, victim_cls)  # type: ignore[arg-type]
++        if evt.killer.squad_id:
++            ENGINE.on_squad_tank_kill(evt.killer.team, evt.killer.squad_id)
++        # Persist event
++        append_jsonl("tank_kills.jsonl", {
++            "ts": now_ts(),
++            "killer_team": evt.killer.team,
++            "killer_squad": evt.killer.squad_id,
++            "victim_team": evt.victim_vehicle.side,
++            "victim_class": victim_cls,
++            "victim_name": evt.victim_vehicle.name,
++            "map": evt.map,
++            "match_id": evt.match_id,
++        })
++        return {"ok": True}
++
++    if t == "player_death":
++        evt = _validate(PlayerDeath, data)
++        if evt.squad_id:
++            ENGINE.on_squad_member_death(evt.team, evt.squad_id)
++        return {"ok": True}
++
++    return {"ignored": t}
+
+*** a/enhanced_discord_bot.py
+--- b/enhanced_discord_bot.py
+@@
+ import os
+@@
+ from discord.ext import commands
++from discord.ext import tasks
+@@
+ from dotenv import load_dotenv
+@@
+-from tankscore.score_engine import ScoreEngine
+-from tankscore.webhook_server import app as webhook_app, ENGINE as WEBHOOK_ENGINE
++# Tank scoring imports
++from tankscore.score_engine import ScoreEngine
++import tankscore.webhook_server as webhook_server
++from tankscore.discord_ui import register_slash_commands
++import uvicorn, threading
+@@
+ load_dotenv()
+@@
+-bot = commands.Bot(command_prefix="!", intents=commands.Intents.default())
+-engine = ScoreEngine()
+-WEBHOOK_ENGINE = engine  # hand over to FastAPI
++bot = commands.Bot(command_prefix="!", intents=commands.Intents.default())
++engine = ScoreEngine()
++webhook_app = webhook_server.app
++webhook_server.ENGINE = engine  # hand the engine to FastAPI
++register_slash_commands(bot, engine)
+@@
+ @bot.event
+ async def on_ready():
+     print(f"Logged in as {bot.user}")
+-    start_webhook_if_needed()
+-    tick_scores.start()
++    start_webhook_if_needed()
++    tick_scores.start()
+     try:
+         await bot.tree.sync()
+         print("Slash commands synced.")
+     except Exception as e:
+         print("Slash sync failed:", e)
+@@
++def start_webhook_if_needed():
++    host = os.getenv("HLU_WEBHOOK_BIND","")
++    port = int(os.getenv("HLU_WEBHOOK_PORT","0") or 0)
++    if not host or not port:
++        print("[TankScore] Webhook disabled (HLU_WEBHOOK_BIND/PORT not set).")
++        return
++    def _run():
++        uvicorn.run(webhook_app, host=host, port=port, log_level="info")
++    th = threading.Thread(target=_run, daemon=True, name="hlu-webhook")
++    th.start()
++    print(f"[TankScore] Webhook listening on http://{host}:{port}/event")
++
++@tasks.loop(seconds=1.0)
++async def tick_scores():
++    engine.tick()
++    # could update a live message here later

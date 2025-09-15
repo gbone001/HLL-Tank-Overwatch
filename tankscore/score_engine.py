@@ -37,11 +37,30 @@ class ScoreEngine:
         # squad streaks: key = (team, squad_id)
         self.squads = {}
         self._lock = threading.RLock()
+        # optional observers; callables that accept a string reason
+        self._listeners = []  # type: ignore[var-annotated]
+
+    def add_listener(self, func):
+        """Register a callback invoked on important scoring changes.
+        func(reason: str) will be called from the originating thread.
+        Reasons: 'mid_change', 'tank_kill'
+        """
+        with self._lock:
+            self._listeners.append(func)
+
+    def _notify(self, reason: str):
+        # fire-and-forget; never raise out
+        for fn in list(self._listeners):
+            try:
+                fn(reason)
+            except Exception:
+                pass
 
     # ---------- Phase 1 ----------
     def set_sector_owner(self, sector_id: int, new_team: Optional[Team]):
         """Call this from your capture/ownership change handler."""
         with self._lock:
+            prev_mid = self.holding_mid_team
             self.control["ALLIES"].discard(sector_id)
             self.control["AXIS"].discard(sector_id)
             if new_team:
@@ -52,6 +71,9 @@ class ScoreEngine:
                 self.holding_mid_team = "ALLIES"
             elif 3 in self.control["AXIS"]:
                 self.holding_mid_team = "AXIS"
+        # notify outside lock
+        if self.holding_mid_team != prev_mid:
+            self._notify('mid_change')
 
     def tick(self):
         """Accrue per-second points for mid & '4th point held'."""
@@ -74,6 +96,7 @@ class ScoreEngine:
         with self._lock:
             self.score_tanks[killer_team] += self.tank_kill_pts
             self.kills_by_class[killer_team][victim_class] += 1
+        self._notify('tank_kill')
 
     # ---------- Phase 3 (squad streaks & awards) ----------
     def _squad_key(self, team: Team, squad_id: str):
@@ -101,6 +124,16 @@ class ScoreEngine:
         with self._lock:
             S = self._ensure_squad(team, squad_id)
             S["current_streak"] = 0
+
+    def reset(self):
+        with self._lock:
+            self.control = {"ALLIES": set(), "AXIS": set()}
+            self.holding_mid_team = None
+            self.last_tick = time.monotonic()
+            self.score_mid_fourth = {"ALLIES": 0.0, "AXIS": 0.0}
+            self.score_tanks = {"ALLIES": 0, "AXIS": 0}
+            self.kills_by_class = {"ALLIES": defaultdict(int), "AXIS": defaultdict(int)}
+            self.squads = {}
 
     def compute_awards(self):
         """Return (award_points_by_team, details) at match end."""

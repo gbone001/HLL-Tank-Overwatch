@@ -16,15 +16,6 @@ from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from discord import app_commands
 from datetime import timezone, timedelta
-import os
-import threading
-import uvicorn
-from discord.ext import tasks
-
-from tankscore.score_engine import ScoreEngine
-from tankscore.discord_ui import register_slash_commands
-import tankscore.webhook_server as webhook_server
-webhook_app = webhook_server.app
 
 # Set up logging
 logging.basicConfig(
@@ -50,59 +41,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 clocks = {}
 LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '0')) if os.getenv('LOG_CHANNEL_ID', '0').isdigit() else 0
 RESULTS_TARGET = None  # Will store channel/thread ID for results
-# TankScore scoreboard messages keyed by channel id
-TANKSCORE_SCOREBOARDS = {}  # channel_id -> discord.Message
-
-# Track last seen owner per sector to avoid spamming engine
-_last_owners = {1: None, 2: None, 3: None, 4: None, 5: None}
-
-@tasks.loop(seconds=int(os.getenv("CRCON_POLL_SEC","2")))
-async def poll_crcon_sectors():
-    base = os.getenv("CRCON_HOST")
-    token = os.getenv("CRCON_TOKEN")
-    if not base or not token:
-        return  # disabled
-    try:
-        async with aiohttp.ClientSession() as sess:
-            # Replace this endpoint with your CRCON’s sector API
-            # Expecting a JSON like: {"sectors": [{"id":1,"owner":"ALLIES"}, ...]}
-            url = f"{base}/api/sectors"
-            headers = {"Authorization": f"Bearer {token}"}
-            async with sess.get(url, headers=headers, timeout=5) as r:
-                data = await r.json()
-
-        # Parse & update owners
-        for s in data.get("sectors", []):
-            sid = int(s["id"])
-            owner = s.get("owner")
-            owner = owner if owner in ("ALLIES", "AXIS") else None
-            if sid in _last_owners and _last_owners[sid] != owner:
-                engine.set_sector_owner(sid, owner)
-                _last_owners[sid] = owner
-
-    except Exception as e:
-        print("[TankScore] CRCON poll error:", e)
-
-def start_webhook_if_enabled():
-    host = os.getenv("HLU_WEBHOOK_BIND", "")
-    port_str = os.getenv("HLU_WEBHOOK_PORT", "")
-    if not host or not port_str:
-        print("[tankscore] Webhook disabled (set HLU_WEBHOOK_BIND/HLU_WEBHOOK_PORT to enable).")
-        return
-
-    try:
-        port = int(port_str)
-    except ValueError:
-        print(f"[tankscore] Invalid HLU_WEBHOOK_PORT={port_str!r}")
-        return
-
-    def _run():
-        # FastAPI served by uvicorn in a daemon thread
-        uvicorn.run(webhook_app, host=host, port=port, log_level="info")
-
-    t = threading.Thread(target=_run, name="TankScoreWebhook", daemon=True)
-    t.start()
-    print(f"[tankscore] Webhook listening at http://{host}:{port}/event")
 
 class APIKeyCRCONClient:
     """CRCON client using API key authentication"""
@@ -461,15 +399,6 @@ class ClockState:
         # Start the clock if this is the first switch
         if not self.clock_started:
             self.clock_started = True
-
-        # Hook sector ownership updates to the engine
-        # engine is the shared ScoreEngine instance
-        if team == "A":
-            engine.set_sector_owner(sector_id=3, new_team="ALLIES")
-        elif team == "B":
-            engine.set_sector_owner(sector_id=3, new_team="AXIS")
-        else:
-            engine.set_sector_owner(sector_id=3, new_team=None)
         
         # Send notification to game (if messaging works)
         if self.crcon_client:
@@ -1416,111 +1345,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
     except Exception as e:
         logger.error(f"Could not send error message: {e}")
 
-# Create the shared scoring engine and expose it to the webhook server
-engine = ScoreEngine()
-webhook_server.ENGINE = engine  # sets the module's global used by FastAPI
-print("[TankScore] ENGINE wired?",
-      "OK" if webhook_server.ENGINE is engine else "NOT SET")
-
-# Wire engine change notifications to refresh the scoreboard safely from any thread
-def _engine_listener(reason: str):
-    try:
-        if hasattr(bot, 'loop') and bot.loop:
-            bot.loop.call_soon_threadsafe(lambda: asyncio.create_task(update_all_tankscore_scoreboards()))
-    except Exception:
-        pass
-
-try:
-    engine.add_listener(_engine_listener)
-except Exception:
-    pass
-
-def _fmt_kbc(kbc):
-    # kbc: Dict[Team, Dict[VehicleClass, int]] -> concise string
-    def one(team):
-        if not kbc.get(team):
-            return "-"
-        return ", ".join(f"{cls}:{cnt}" for cls, cnt in kbc[team].items())
-    return one
-
-def build_tankscore_embed():
-    phase1, phase2, kbc = engine.totals()
-    holder = engine.holding_mid_team or "-"
-    embed = discord.Embed(title="TankScore Scoreboard", color=0x2b2d31)
-    embed.add_field(name="Mid Holder (Sector 3)", value=str(holder), inline=False)
-    embed.add_field(name="Hold Points (mid + >=4)", value=f"ALLIES: {phase1['ALLIES']} | AXIS: {phase1['AXIS']}", inline=False)
-    embed.add_field(name="Tank Kill Points", value=f"ALLIES: {phase2['ALLIES']} | AXIS: {phase2['AXIS']}", inline=False)
-    total_allies = round(phase1['ALLIES'],2) + phase2['ALLIES']
-    total_axis = round(phase1['AXIS'],2) + phase2['AXIS']
-    embed.add_field(name="Total Points", value=f"ALLIES: {round(total_allies,2)} | AXIS: {round(total_axis,2)}", inline=False)
-    fmt = _fmt_kbc(kbc)
-    embed.add_field(name="Kills by Class (ALLIES)", value=fmt('ALLIES'), inline=False)
-    embed.add_field(name="Kills by Class (AXIS)", value=fmt('AXIS'), inline=False)
-    embed.set_footer(text="Updates: every 10m, on mid change, or tank kill")
-    return embed
-
-async def update_all_tankscore_scoreboards():
-    if not TANKSCORE_SCOREBOARDS:
-        return
-    embed = build_tankscore_embed()
-    # copy to avoid mutation during iteration
-    items = list(TANKSCORE_SCOREBOARDS.items())
-    for channel_id, message in items:
-        try:
-            await message.edit(embed=embed)
-        except Exception:
-            # if message no longer exists, drop it
-            TANKSCORE_SCOREBOARDS.pop(channel_id, None)
-
-# --- TankScore Slash Commands ---
-@bot.tree.command(name="tankscore_status", description="Show live tank scoring totals")
-async def tankscore_status(interaction: discord.Interaction):
-    phase1, phase2, kbc = engine.totals()  # phase1 are floats, phase2 are ints
-    def fmt(d): return ", ".join(f"{k}:{v}" for k, v in d.items()) if d else "—"
-    msg = (
-        f"**Phase 1 (Mid + ≥4 sectors)**\n"
-        f"ALLIES: {phase1['ALLIES']} | AXIS: {phase1['AXIS']}\n\n"
-        f"**Phase 2 (Tank points)**\n"
-        f"ALLIES: {phase2['ALLIES']} | AXIS: {phase2['AXIS']}\n\n"
-        f"**Kills by class**\n"
-        f"ALLIES: {fmt(kbc['ALLIES'])}\n"
-        f"AXIS:   {fmt(kbc['AXIS'])}"
-    )
-    await interaction.response.send_message(msg, ephemeral=True)
-
-@bot.tree.command(name="tankscore_scoreboard", description="Post and auto-refresh the TankScore scoreboard here or in a channel")
-async def tankscore_scoreboard(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
-    try:
-        await interaction.response.defer(ephemeral=True)
-        target = channel or interaction.channel
-        embed = build_tankscore_embed()
-        msg = await target.send(embed=embed)
-        TANKSCORE_SCOREBOARDS[target.id] = msg
-        await interaction.edit_original_response(content=f"TankScore scoreboard started in #{target.name}.")
-    except Exception as e:
-        await interaction.edit_original_response(content=f"Failed to start scoreboard: {e}")
-
-@tasks.loop(minutes=10)
-async def refresh_tankscore_scoreboards():
-    await update_all_tankscore_scoreboards()
-
-@bot.tree.command(name="tankscore_end", description="Compute end-of-match awards and show totals")
-async def tankscore_end(interaction: discord.Interaction):
-    awards, details = engine.compute_awards()
-    phase1, phase2, _ = engine.totals()
-    def total(team):
-        return round(phase1[team], 2) + phase2[team] + awards[team]
-    msg = (
-        f"**Awards** (Veteran +{engine.vet_pts}, Ace +{engine.ace_pts}, IRONHIDE +{engine.ironhide_pts})\n"
-        f"Veteran squads: {details['veteran'] or '—'}\n"
-        f"Ace squads:     {details['ace'] or '—'}\n"
-        f"IRONHIDE:       {details['ironhide'] or '—'}\n\n"
-        f"**Totals**\n"
-        f"ALLIES → Phase1={round(phase1['ALLIES'],2)}  Phase2={phase2['ALLIES']}  Awards={awards['ALLIES']}  = **{total('ALLIES')}**\n"
-        f"AXIS    → Phase1={round(phase1['AXIS'],2)}    Phase2={phase2['AXIS']}    Awards={awards['AXIS']}    = **{total('AXIS')}**"
-    )
-    await interaction.response.send_message(msg)
-
 @bot.event
 async def on_ready():
     logger.info(f"✅ Bot logged in as {bot.user}")
@@ -1538,11 +1362,6 @@ async def on_ready():
     except Exception as e:
         logger.warning(f"⚠️ CRCON connection test failed: {e}")
     
-    # Register TankScore admin commands, then sync
-    try:
-        register_slash_commands(bot, engine)
-    except Exception as e:
-        logger.warning(f"Could not register TankScore admin commands: {e}")
     # Sync commands
     await bot.wait_until_ready()
     try:
@@ -1553,17 +1372,6 @@ async def on_ready():
         print(f"🎉 HLL Tank Overwatch Clock ready! Use /reverse_clock to start")
     except Exception as e:
         logger.error(f"❌ Command sync failed: {e}")
-    
-    print(f"Logged in as {bot.user}")
-    start_webhook_if_enabled()
-    tick_scores.start()     # (we'll add this task below)
-    refresh_tankscore_scoreboards.start()
-    poll_crcon_sectors.start()
-    # If you use app commands (slash), ensure the tree syncs:
-    try:
-        await bot.tree.sync()
-    except Exception as e:
-        print("[tankscore] slash command sync failed:", e)
 
 # Main execution
 if __name__ == "__main__":
@@ -1606,12 +1414,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
         print(f"❌ Bot startup failed: {e}")
-
-@tasks.loop(seconds=1.0)
-async def tick_scores():
-    # Add per-second mid / >=4 sectors points
-    engine.tick()
-
-    # If you maintain a live “status” message or embed, update it here
-    # Example:
-    # await update_status_embed()
