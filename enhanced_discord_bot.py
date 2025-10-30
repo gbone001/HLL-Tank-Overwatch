@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-HLL Discord Bot with API Key CRCON Integration
-Time Control Focused - Win by controlling the center point longest!
-Updated with corrected CRCON API endpoints
+HLL Discord Bot with DMT Scoring System
+Combines Combat Scores and Center Point Control Time
 """
 
 import asyncio
@@ -17,18 +16,19 @@ from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from discord import app_commands
 from datetime import timezone, timedelta
+from typing import Dict, List, Optional, Tuple
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler()  # Railway captures stdout
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Create directories if running locally (Railway handles this differently)
+# Create directories if running locally
 if not os.getenv('RAILWAY_ENVIRONMENT'):
     for directory in ['logs', 'match_reports', 'match_data', 'backups']:
         os.makedirs(directory, exist_ok=True)
@@ -41,6 +41,49 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 clocks = {}
 LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '0')) if os.getenv('LOG_CHANNEL_ID', '0').isdigit() else 0
+
+class PlayerScore:
+    """Track individual player scores"""
+    def __init__(self, name: str, player_id: str):
+        self.name = name
+        self.player_id = player_id
+        self.combat_score = 0
+        self.kills = 0
+        self.deaths = 0
+        self.role = ""
+        self.squad = ""
+        self.is_commander = False
+        self.precision_strike_score = 0
+
+class TeamScores:
+    """Track team scores for DMT system"""
+    def __init__(self):
+        self.crew_scores = []  # List of highest scores from each tank crew
+        self.commander_score = 0
+        self.commander_pstrike_score = 0
+        self.center_point_seconds = 0
+        self.total_combat_score = 0
+        self.total_cap_score = 0
+        self.total_dmt_score = 0
+        self.players = {}  # player_id -> PlayerScore
+        
+    def calculate_dmt_score(self):
+        """Calculate DMT total score"""
+        # Get top 4 crew scores (highest CS from each crew)
+        top_4_crews = sorted(self.crew_scores, reverse=True)[:4]
+        while len(top_4_crews) < 4:
+            top_4_crews.append(0)  # Pad with 0 if less than 4 crews
+        
+        # TOTAL COMBAT SCORE = (3 × (sum of top 4 crew scores)) + Commander P-Strike CS
+        self.total_combat_score = (3 * sum(top_4_crews)) + self.commander_pstrike_score
+        
+        # TOTAL CENTER POINT CAP SCORE = seconds × 0.5
+        self.total_cap_score = self.center_point_seconds * 0.5
+        
+        # TOTAL SCORE
+        self.total_dmt_score = self.total_combat_score + self.total_cap_score
+        
+        return self.total_dmt_score
 
 class APIKeyCRCONClient:
     """CRCON client using API key authentication"""
@@ -91,7 +134,9 @@ class APIKeyCRCONClient:
                 self._get_endpoint('/api/get_gamestate'),
                 self._get_endpoint('/api/get_team_view'),
                 self._get_endpoint('/api/get_map'),
-                self._get_endpoint('/api/get_players')
+                self._get_endpoint('/api/get_players'),
+                self._get_endpoint('/api/get_detailed_players'),
+                self._get_endpoint('/api/get_live_game_stats')
             ]
             
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -101,12 +146,16 @@ class APIKeyCRCONClient:
             team_view = results[1] if not isinstance(results[1], Exception) else {}
             map_info = results[2] if not isinstance(results[2], Exception) else {}
             players = results[3] if not isinstance(results[3], Exception) else {}
+            detailed_players = results[4] if not isinstance(results[4], Exception) else {}
+            live_stats = results[5] if not isinstance(results[5], Exception) else {}
             
             return {
                 'game_state': game_state,
                 'team_view': team_view,
                 'map_info': map_info,
                 'players': players,
+                'detailed_players': detailed_players,
+                'live_stats': live_stats,
                 'timestamp': datetime.datetime.now(timezone.utc)
             }
             
@@ -130,10 +179,8 @@ class APIKeyCRCONClient:
     async def send_message(self, message: str):
         """Send message to all players individually"""
         try:
-            # First get all connected players - UPDATED ENDPOINT
             logger.info(f"Getting player list to send message: {message}")
             
-            # FIXED: Using correct endpoint with underscore
             async with self.session.get(f"{self.base_url}/api/get_player_ids") as response:
                 if response.status != 200:
                     logger.warning(f"Failed to get player list: {response.status}")
@@ -142,7 +189,6 @@ class APIKeyCRCONClient:
                 player_data = await response.json()
                 logger.info(f"Player data response: {player_data}")
                 
-                # Extract player list from the result
                 if isinstance(player_data, dict) and 'result' in player_data:
                     players = player_data['result']
                 else:
@@ -155,10 +201,8 @@ class APIKeyCRCONClient:
                 success_count = 0
                 total_players = len(players)
                 
-                # Send message to each player individually
                 for player in players:
                     try:
-                        # Handle both list format [name, id] and dict format
                         if isinstance(player, list) and len(player) >= 2:
                             player_name = player[0]
                             player_id = player[1]
@@ -168,7 +212,6 @@ class APIKeyCRCONClient:
                         else:
                             continue
                         
-                        # Send individual message
                         payload = {
                             "player_name": player_name,
                             "player_id": player_id,
@@ -195,18 +238,23 @@ class APIKeyCRCONClient:
             return False
 
 class ClockState:
-    """Enhanced clock state with live updating team times"""
+    """Enhanced clock state with DMT scoring"""
     
     def __init__(self):
-        self.time_a = 0
-        self.time_b = 0
+        # Time tracking
+        self.time_a = 0  # Allies center point seconds
+        self.time_b = 0  # Axis center point seconds
         self.active = None
         self.last_switch = None
         self.match_start_time = None
-        self.countdown_end = None  # Add this back
+        self.countdown_end = None
         self.message = None
         self.started = False
         self.clock_started = False
+        
+        # DMT Scoring
+        self.allies_scores = TeamScores()
+        self.axis_scores = TeamScores()
         
         # CRCON integration
         self.crcon_client = None
@@ -215,14 +263,9 @@ class ClockState:
         self.last_scores = {'allied': 0, 'axis': 0}
         self.switches = []
         self.last_update = None
-
-    def get_time_remaining(self):
-        """Get time remaining in match"""
-        if self.countdown_end:
-            now = datetime.datetime.now(timezone.utc)
-            remaining = (self.countdown_end - now).total_seconds()
-            return max(0, int(remaining))
-        return 4500  # Default 1h 15m
+        
+        # Score tracking
+        self.score_tracking_enabled = os.getenv('DMT_SCORING', 'true').lower() == 'true'
 
     def get_current_elapsed(self):
         """Get elapsed time since last switch"""
@@ -234,13 +277,11 @@ class ClockState:
         """Get total time for a team INCLUDING current elapsed time"""
         if team == "A":
             base_time = self.time_a
-            # Add current elapsed time if Allies are currently active
             if self.active == "A" and self.clock_started:
                 base_time += self.get_current_elapsed()
             return base_time
         elif team == "B":
             base_time = self.time_b
-            # Add current elapsed time if Axis are currently active
             if self.active == "B" and self.clock_started:
                 base_time += self.get_current_elapsed()
             return base_time
@@ -251,7 +292,6 @@ class ClockState:
         total = self.total_time(team)
         
         if self.active == team and self.clock_started:
-            # Currently active - they're defending the point they control
             current_elapsed = self.get_current_elapsed()
             return {
                 'total_time': total,
@@ -260,7 +300,6 @@ class ClockState:
                 'is_active': True
             }
         else:
-            # Not active - they're trying to attack and take the point
             return {
                 'total_time': total,
                 'status': '⚔️ Attacking',
@@ -271,7 +310,6 @@ class ClockState:
     async def connect_crcon(self):
         """Connect to CRCON with API key"""
         try:
-            # Close any existing connection first
             if self.crcon_client:
                 try:
                     await self.crcon_client.__aexit__(None, None, None)
@@ -288,7 +326,7 @@ class ClockState:
             return False
     
     async def update_from_game(self):
-        """Update from CRCON game data"""
+        """Update from CRCON game data including player scores"""
         if not self.crcon_client:
             return
         
@@ -300,12 +338,14 @@ class ClockState:
             self.game_data = live_data
             self.last_update = datetime.datetime.now(timezone.utc)
             
-            # Only check for auto-switch if we have previous scores to compare
-            # This prevents false triggers on first connection
+            # Update player scores for DMT scoring
+            if self.score_tracking_enabled:
+                await self._update_player_scores()
+            
+            # Check for auto-switch
             if self.auto_switch and self.started and hasattr(self, '_first_update_done'):
                 await self._check_score_changes()
             else:
-                # First update - just store the scores without triggering auto-switch
                 game_state = self.game_data.get('game_state', {})
                 if isinstance(game_state, dict) and 'result' in game_state:
                     result = game_state['result']
@@ -319,14 +359,84 @@ class ClockState:
         except Exception as e:
             logger.error(f"Error updating from game: {e}")
     
+    async def _update_player_scores(self):
+        """Update player combat scores for DMT calculation"""
+        if not self.game_data:
+            return
+        
+        try:
+            detailed_players = self.game_data.get('detailed_players', {})
+            team_view = self.game_data.get('team_view', {})
+            
+            if isinstance(detailed_players, dict) and 'result' in detailed_players:
+                players_data = detailed_players['result']
+                
+                # Process teams
+                if 'teams' in players_data:
+                    for team_name, team_data in players_data['teams'].items():
+                        team_scores = self.allies_scores if team_name == 'allies' else self.axis_scores
+                        
+                        # Track squads for crew identification
+                        squad_scores = {}  # squad_name -> highest_score
+                        
+                        if 'squads' in team_data:
+                            for squad_name, squad_data in team_data['squads'].items():
+                                highest_squad_score = 0
+                                
+                                # Check if this is a tank crew squad (contains "tank" or specific squad names)
+                                is_tank_crew = any(keyword in squad_name.lower() for keyword in ['tank', 'armor', 'crew'])
+                                
+                                if 'players' in squad_data:
+                                    for player in squad_data['players']:
+                                        player_name = player.get('name', '')
+                                        player_id = player.get('steam_id_64', '')
+                                        combat_score = player.get('combat', 0)
+                                        kills = player.get('kills', 0)
+                                        deaths = player.get('deaths', 0)
+                                        role = player.get('role', '')
+                                        
+                                        # Create or update player score
+                                        if player_id not in team_scores.players:
+                                            team_scores.players[player_id] = PlayerScore(player_name, player_id)
+                                        
+                                        ps = team_scores.players[player_id]
+                                        ps.combat_score = combat_score
+                                        ps.kills = kills
+                                        ps.deaths = deaths
+                                        ps.role = role
+                                        ps.squad = squad_name
+                                        
+                                        # Check if commander
+                                        if role.lower() == 'commander' or squad_name.lower() == 'command':
+                                            ps.is_commander = True
+                                            team_scores.commander_score = combat_score
+                                            # Extract P-Strike score if available
+                                            # This might need adjustment based on CRCON data format
+                                            team_scores.commander_pstrike_score = player.get('offensive', 0)
+                                        
+                                        # Track highest score in tank crew
+                                        if is_tank_crew and combat_score > highest_squad_score:
+                                            highest_squad_score = combat_score
+                                
+                                # Add highest crew score
+                                if is_tank_crew and highest_squad_score > 0:
+                                    squad_scores[squad_name] = highest_squad_score
+                        
+                        # Update crew scores list
+                        team_scores.crew_scores = list(squad_scores.values())
+                        
+            logger.debug(f"Updated player scores - Allies crews: {len(self.allies_scores.crew_scores)}, Axis crews: {len(self.axis_scores.crew_scores)}")
+            
+        except Exception as e:
+            logger.error(f"Error updating player scores: {e}")
+    
     async def _check_score_changes(self):
-        """Check for captures to trigger auto-switch - focus on point control"""
+        """Check for captures to trigger auto-switch"""
         if not self.game_data or 'game_state' not in self.game_data:
             return
         
         game_state = self.game_data['game_state']
         
-        # Parse your CRCON's result format for scores
         current_allied = 0
         current_axis = 0
         
@@ -336,10 +446,8 @@ class ClockState:
                 current_allied = result.get('allied_score', 0)
                 current_axis = result.get('axis_score', 0)
         
-        # Debug logging to see what's happening
         logger.info(f"Score check - Allied: {self.last_scores['allied']} -> {current_allied}, Axis: {self.last_scores['axis']} -> {current_axis}")
         
-        # Check for score increases (point captures)
         if current_allied > self.last_scores['allied']:
             logger.info(f"Allied score increased! Switching to Allies")
             await self._auto_switch_to('A', "Allies captured the center point")
@@ -349,7 +457,6 @@ class ClockState:
         else:
             logger.debug(f"No score changes detected")
         
-        # Update last known scores
         self.last_scores = {'allied': current_allied, 'axis': current_axis}
     
     async def _auto_switch_to(self, team: str, reason: str = "Auto-switch"):
@@ -359,7 +466,6 @@ class ClockState:
         
         now = datetime.datetime.now(timezone.utc)
         
-        # IMPORTANT: Update accumulated time BEFORE switching
         if self.active == "A" and self.last_switch:
             elapsed = (now - self.last_switch).total_seconds()
             self.time_a += elapsed
@@ -367,7 +473,6 @@ class ClockState:
             elapsed = (now - self.last_switch).total_seconds()
             self.time_b += elapsed
         
-        # Record the switch
         switch_data = {
             'from_team': self.active,
             'to_team': team,
@@ -377,23 +482,18 @@ class ClockState:
         }
         self.switches.append(switch_data)
         
-        # Set new active team and reset timer
         self.active = team
         self.last_switch = now
         
-        # Start the clock if this is the first switch
         if not self.clock_started:
             self.clock_started = True
         
-        # Send notification to game (if messaging works)
         if self.crcon_client:
             team_name = "Allies" if team == "A" else "Axis"
-            # Get current control times for both teams
             allies_time = self.format_time(self.total_time('A'))
             axis_time = self.format_time(self.total_time('B'))
             await self.crcon_client.send_message(f"🔄 {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}")
         
-        # IMPORTANT: Update the Discord embed immediately
         if self.message:
             try:
                 await self.message.edit(embed=build_embed(self))
@@ -402,6 +502,35 @@ class ClockState:
                 logger.error(f"Failed to update Discord embed: {e}")
             
         logger.info(f"Auto-switched to team {team}: {reason}")
+    
+    def calculate_final_scores(self):
+        """Calculate final DMT scores when match ends"""
+        # Update center point seconds
+        self.allies_scores.center_point_seconds = int(self.time_a)
+        self.axis_scores.center_point_seconds = int(self.time_b)
+        
+        # Calculate DMT scores
+        self.allies_scores.calculate_dmt_score()
+        self.axis_scores.calculate_dmt_score()
+        
+        return {
+            'allies': {
+                'center_seconds': self.allies_scores.center_point_seconds,
+                'crew_scores': self.allies_scores.crew_scores[:4],  # Top 4
+                'commander_pstrike': self.allies_scores.commander_pstrike_score,
+                'total_combat': self.allies_scores.total_combat_score,
+                'total_cap': self.allies_scores.total_cap_score,
+                'total_dmt': self.allies_scores.total_dmt_score
+            },
+            'axis': {
+                'center_seconds': self.axis_scores.center_point_seconds,
+                'crew_scores': self.axis_scores.crew_scores[:4],  # Top 4
+                'commander_pstrike': self.axis_scores.commander_pstrike_score,
+                'total_combat': self.axis_scores.total_combat_score,
+                'total_cap': self.axis_scores.total_cap_score,
+                'total_dmt': self.axis_scores.total_dmt_score
+            }
+        }
     
     def get_game_info(self):
         """Get formatted game information"""
@@ -414,43 +543,34 @@ class ClockState:
             }
         
         game_state = self.game_data.get('game_state', {})
-        team_view = self.game_data.get('team_view', {})
         map_info = self.game_data.get('map_info', {})
         
-        # Extract map name - handle your CRCON's result wrapper
         current_map = 'Unknown'
         
         if isinstance(map_info, dict) and 'result' in map_info:
             result = map_info['result']
             if isinstance(result, dict):
-                # Try the pretty_name first (should be "Elsenborn Ridge Warfare")
                 if 'pretty_name' in result:
                     current_map = result['pretty_name']
-                # Fallback to nested map object
                 elif 'map' in result and isinstance(result['map'], dict):
                     current_map = result['map'].get('pretty_name', result['map'].get('name', 'Unknown'))
         
-        # Extract player count from your CRCON result format
         player_count = 0
         if isinstance(game_state, dict) and 'result' in game_state:
             result = game_state['result']
             if isinstance(result, dict):
-                # Your format shows num_allied_players and num_axis_players
                 allied_players = result.get('num_allied_players', 0)
                 axis_players = result.get('num_axis_players', 0)
                 player_count = allied_players + axis_players
         
-        # Extract game time from your CRCON result format - convert to remaining time display
         game_time_remaining = 0
         if isinstance(game_state, dict) and 'result' in game_state:
             result = game_state['result']
             if isinstance(result, dict):
-                # Get the raw time remaining from server
                 raw_time = result.get('time_remaining', 0)
                 if raw_time > 0:
                     game_time_remaining = raw_time
         
-        # Track scores internally for auto-switch using your CRCON format
         allied_score = 0
         axis_score = 0
         
@@ -460,13 +580,12 @@ class ClockState:
                 allied_score = result.get('allied_score', 0)
                 axis_score = result.get('axis_score', 0)
         
-        # Store scores for auto-switch logic
         self.last_scores = {'allied': allied_score, 'axis': axis_score}
         
         return {
             'map': current_map,
             'players': player_count,
-            'game_time': game_time_remaining,  # This is now the server's remaining time
+            'game_time': game_time_remaining,
             'connection_status': 'Connected',
             'last_update': self.last_update.strftime('%H:%M:%S') if self.last_update else 'Never'
         }
@@ -479,66 +598,139 @@ def user_is_admin(interaction: discord.Interaction):
     return any(role.name.lower() == admin_role for role in interaction.user.roles)
 
 def build_embed(clock: ClockState):
-    """Build Discord embed focused on TIME CONTROL"""
+    """Build Discord embed with DMT scoring info"""
     embed = discord.Embed(
-        title="🎯 🔥 HLL Tank Overwatch 🔥 🎯",
-        description="**Control the center point to win!**",
+        title="🎯 🔥 HLL Tank Overwatch - DMT Scoring 🔥 🎯",
+        description="**Control the center point & maximize combat scores to win!**",
         color=0x800020
     )
     
-    # Add game information
     game_info = clock.get_game_info()
     
-    # Start with map and players
     embed.description += f"\n🗺️ **Map:** {game_info['map']}\n👥 **Players:** {game_info['players']}/100"
     
-    # Add server game time instead of match duration
     if game_info['game_time'] > 0:
         embed.description += f"\n⏰ **Server Game Time:** `{clock.format_time(game_info['game_time'])}`"
     
-    # Get live status for both teams
+    # Center point control times
     allies_status = clock.get_live_status('A')
     axis_status = clock.get_live_status('B')
     
-    # Build team information focused on TIME CONTROL
     allies_value = f"**Control Time:** `{clock.format_time(allies_status['total_time'])}`\n**Status:** {allies_status['status']}"
     axis_value = f"**Control Time:** `{clock.format_time(axis_status['total_time'])}`\n**Status:** {axis_status['status']}"
     
-    # Add current session info for active team
     if allies_status['is_active'] and allies_status['current_session'] > 0:
         allies_value += f"\n**Current Hold:** `{clock.format_time(allies_status['current_session'])}`"
     elif axis_status['is_active'] and axis_status['current_session'] > 0:
         axis_value += f"\n**Current Hold:** `{clock.format_time(axis_status['current_session'])}`"
     
-    # Add time advantage calculation
+    # Add preliminary DMT scores if scoring is enabled
+    if clock.score_tracking_enabled and clock.started:
+        # Calculate current scores
+        clock.allies_scores.center_point_seconds = int(clock.total_time('A'))
+        clock.axis_scores.center_point_seconds = int(clock.total_time('B'))
+        
+        allies_cap_score = clock.allies_scores.center_point_seconds * 0.5
+        axis_cap_score = clock.axis_scores.center_point_seconds * 0.5
+        
+        allies_value += f"\n**Cap Points:** `{allies_cap_score:.1f}`"
+        axis_value += f"\n**Cap Points:** `{axis_cap_score:.1f}`"
+        
+        # Add crew count if available
+        if len(clock.allies_scores.crew_scores) > 0:
+            allies_value += f"\n**Tank Crews:** `{len(clock.allies_scores.crew_scores)}`"
+        if len(clock.axis_scores.crew_scores) > 0:
+            axis_value += f"\n**Tank Crews:** `{len(clock.axis_scores.crew_scores)}`"
+    
+    embed.add_field(name="🇺🇸 Allies", value=allies_value, inline=True)
+    embed.add_field(name="🇩🇪 Axis", value=axis_value, inline=True)
+    
+    # Current leader by time
     time_diff = abs(allies_status['total_time'] - axis_status['total_time'])
     if allies_status['total_time'] > axis_status['total_time']:
-        allies_value += f"\n**Advantage:** `+{clock.format_time(time_diff)}`"
+        leader_text = f"🏆 **Time Leader:** Allies (+{clock.format_time(time_diff)})"
     elif axis_status['total_time'] > allies_status['total_time']:
-        axis_value += f"\n**Advantage:** `+{clock.format_time(time_diff)}`"
-    
-    embed.add_field(name="🇺🇸 Allies", value=allies_value, inline=False)
-    embed.add_field(name="🇩🇪 Axis", value=axis_value, inline=False)
-    
-    # Add current leader status
-    if allies_status['total_time'] > axis_status['total_time']:
-        leader_text = "🏆 **Current Leader:** Allies"
-    elif axis_status['total_time'] > allies_status['total_time']:
-        leader_text = "🏆 **Current Leader:** Axis"
+        leader_text = f"🏆 **Time Leader:** Axis (+{clock.format_time(time_diff)})"
     else:
         leader_text = "⚖️ **Status:** Tied"
     
     embed.add_field(name="🎯 Point Control", value=leader_text, inline=False)
     
-    # Footer with connection status
+    # Footer
     connection_status = f"🟢 CRCON Connected" if clock.crcon_client else "🔴 CRCON Disconnected"
     auto_status = " | 🤖 Auto ON" if clock.auto_switch else " | 🤖 Auto OFF"
+    dmt_status = " | 📊 DMT ON" if clock.score_tracking_enabled else ""
     
-    footer_text = f"Match Clock by {os.getenv('BOT_AUTHOR', 'StoneyRebel')} | {connection_status}{auto_status}"
+    footer_text = f"Match Clock by {os.getenv('BOT_AUTHOR', 'StoneyRebel')} | {connection_status}{auto_status}{dmt_status}"
     if game_info.get('last_update'):
         footer_text += f" | Updated: {game_info['last_update']}"
     
     embed.set_footer(text=footer_text)
+    return embed
+
+def build_final_dmt_embed(clock: ClockState, scores: dict):
+    """Build final match embed with DMT scores"""
+    embed = discord.Embed(
+        title="🏁 Match Complete - DMT Scoring Results!",
+        color=0x800020
+    )
+    
+    game_info = clock.get_game_info()
+    if game_info['connection_status'] == 'Connected':
+        embed.add_field(name="🗺️ Map", value=game_info['map'], inline=True)
+        embed.add_field(name="👥 Players", value=f"{game_info['players']}/100", inline=True)
+        embed.add_field(name="🔄 Switches", value=str(len(clock.switches)), inline=True)
+    
+    # DMT Scoring Breakdown
+    embed.add_field(name="━━━━━ DMT SCORING ━━━━━", value="", inline=False)
+    
+    # Allies scores
+    allies_scores = scores['allies']
+    allies_breakdown = f"**Center Point Time:** `{allies_scores['center_seconds']}s`\n"
+    allies_breakdown += f"**Cap Score:** `{allies_scores['total_cap']:.1f}` (× 0.5)\n"
+    allies_breakdown += f"**Top 4 Crews:** `{sum(allies_scores['crew_scores'])}`\n"
+    allies_breakdown += f"**Combat Score:** `{allies_scores['total_combat']}`\n"
+    if allies_scores['commander_pstrike'] > 0:
+        allies_breakdown += f"**Cmdr P-Strike:** `{allies_scores['commander_pstrike']}`\n"
+    allies_breakdown += f"**TOTAL DMT:** `{allies_scores['total_dmt']:.1f}`"
+    
+    embed.add_field(name="🇺🇸 Allies", value=allies_breakdown, inline=True)
+    
+    # Axis scores
+    axis_scores = scores['axis']
+    axis_breakdown = f"**Center Point Time:** `{axis_scores['center_seconds']}s`\n"
+    axis_breakdown += f"**Cap Score:** `{axis_scores['total_cap']:.1f}` (× 0.5)\n"
+    axis_breakdown += f"**Top 4 Crews:** `{sum(axis_scores['crew_scores'])}`\n"
+    axis_breakdown += f"**Combat Score:** `{axis_scores['total_combat']}`\n"
+    if axis_scores['commander_pstrike'] > 0:
+        axis_breakdown += f"**Cmdr P-Strike:** `{axis_scores['commander_pstrike']}`\n"
+    axis_breakdown += f"**TOTAL DMT:** `{axis_scores['total_dmt']:.1f}`"
+    
+    embed.add_field(name="🇩🇪 Axis", value=axis_breakdown, inline=True)
+    
+    # Determine winner
+    if allies_scores['total_dmt'] > axis_scores['total_dmt']:
+        winner_text = f"🏆 **ALLIES VICTORY**\n"
+        winner_text += f"**Winning Margin:** `{allies_scores['total_dmt'] - axis_scores['total_dmt']:.1f}` points"
+        embed.color = 0x0066CC  # Blue for Allies
+    elif axis_scores['total_dmt'] > allies_scores['total_dmt']:
+        winner_text = f"🏆 **AXIS VICTORY**\n"
+        winner_text += f"**Winning Margin:** `{axis_scores['total_dmt'] - allies_scores['total_dmt']:.1f}` points"
+        embed.color = 0xCC0000  # Red for Axis
+    else:
+        winner_text = "🤝 **DRAW**\nPerfectly balanced!"
+        embed.color = 0x808080  # Gray for draw
+    
+    embed.add_field(name="🎯 DMT MATCH WINNER", value=winner_text, inline=False)
+    
+    # Scoring formula reminder
+    embed.add_field(
+        name="📐 DMT Formula",
+        value="Combat: (3×Top4Crews) + CmdrPStrike | Cap: Seconds×0.5",
+        inline=False
+    )
+    
+    embed.timestamp = datetime.datetime.now(timezone.utc)
     return embed
 
 class StartControls(discord.ui.View):
@@ -551,29 +743,25 @@ class StartControls(discord.ui.View):
         if not user_is_admin(interaction):
             return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
 
-        # Respond to Discord immediately to prevent timeout
         await interaction.response.defer()
 
         clock = clocks[self.channel_id]
         clock.match_start_time = datetime.datetime.now(timezone.utc)
         clock.started = True
 
-        # Start the updater first
         if not match_updater.is_running():
             match_updater.start(self.channel_id)
 
         view = TimerControls(self.channel_id)
         
-        # Update the embed first
         await clock.message.edit(embed=build_embed(clock), view=view)
         await interaction.followup.send("✅ Match started! Connecting to CRCON...", ephemeral=True)
 
-        # Connect to CRCON after responding to Discord
         crcon_connected = await clock.connect_crcon()
         
         if crcon_connected:
             clock.auto_switch = os.getenv('CRCON_AUTO_SWITCH', 'false').lower() == 'true'
-            await clock.crcon_client.send_message("🎯 HLL Tank Overwatch Match Started! Center point control timer active.")
+            await clock.crcon_client.send_message("🎯 HLL Tank Overwatch Match Started! DMT Scoring Active!")
             await interaction.edit_original_response(content="✅ Match started with CRCON!")
         else:
             await interaction.edit_original_response(content="✅ Match started (CRCON connection failed)")
@@ -589,22 +777,9 @@ class StartControls(discord.ui.View):
                 
                 if live_data:
                     game_state = live_data.get('game_state', {})
-                    map_info = live_data.get('map_info', {})
                     embed = discord.Embed(title="🟢 CRCON Test - SUCCESS", color=0x00ff00)
                     embed.add_field(name="Status", value="✅ Connected", inline=True)
-                    
-                    # Extract map name
-                    map_name = 'Unknown'
-                    if isinstance(map_info, dict):
-                        if 'pretty_name' in map_info:
-                            map_name = map_info['pretty_name']
-                        elif 'name' in map_info:
-                            map_name = map_info['name']
-                        elif 'map' in map_info and isinstance(map_info['map'], dict):
-                            map_name = map_info['map'].get('pretty_name', 'Unknown')
-                    
-                    embed.add_field(name="Map", value=map_name, inline=True)
-                    embed.add_field(name="Players", value=f"{game_state.get('nb_players', 0)}/100", inline=True)
+                    embed.add_field(name="DMT Scoring", value="✅ Ready", inline=True)
                 else:
                     embed = discord.Embed(title="🟡 CRCON Test - PARTIAL", color=0xffaa00)
                     embed.add_field(name="Status", value="Connected but no data", inline=False)
@@ -656,25 +831,34 @@ class TimerControls(discord.ui.View):
             await clock.update_from_game()
             game_info = clock.get_game_info()
             
-            embed = discord.Embed(title="📊 Live Match Stats", color=0x00ff00)
+            embed = discord.Embed(title="📊 Live DMT Match Stats", color=0x00ff00)
             embed.add_field(name="🗺️ Map", value=game_info['map'], inline=True)
             embed.add_field(name="👥 Players", value=f"{game_info['players']}/100", inline=True)
-            embed.add_field(name="🔄 Point Switches", value=str(len(clock.switches)), inline=True)
+            embed.add_field(name="🔄 Switches", value=str(len(clock.switches)), inline=True)
             
-            # Control time breakdown
-            allies_time = clock.total_time('A')
-            axis_time = clock.total_time('B')
-            total_control = allies_time + axis_time
-            
-            if total_control > 0:
-                allies_percent = (allies_time / total_control) * 100
-                axis_percent = (axis_time / total_control) * 100
+            # Current DMT score preview
+            if clock.score_tracking_enabled:
+                clock.allies_scores.center_point_seconds = int(clock.total_time('A'))
+                clock.axis_scores.center_point_seconds = int(clock.total_time('B'))
                 
-                embed.add_field(name="🇺🇸 Allies Control", value=f"{allies_percent:.1f}%", inline=True)
-                embed.add_field(name="🇩🇪 Axis Control", value=f"{axis_percent:.1f}%", inline=True)
+                # Calculate preliminary scores
+                allies_prelim = (clock.allies_scores.center_point_seconds * 0.5) + \
+                               (3 * sum(clock.allies_scores.crew_scores[:4]))
+                axis_prelim = (clock.axis_scores.center_point_seconds * 0.5) + \
+                             (3 * sum(clock.axis_scores.crew_scores[:4]))
+                
+                embed.add_field(
+                    name="🇺🇸 Allies DMT (Prelim)",
+                    value=f"`{allies_prelim:.1f}` points",
+                    inline=True
+                )
+                embed.add_field(
+                    name="🇩🇪 Axis DMT (Prelim)",
+                    value=f"`{axis_prelim:.1f}` points",
+                    inline=True
+                )
             
             embed.add_field(name="🤖 Auto-Switch", value="On" if clock.auto_switch else "Off", inline=True)
-            embed.add_field(name="📡 Last Update", value=game_info['last_update'], inline=True)
             
             await interaction.followup.send(embed=embed, ephemeral=True)
             
@@ -706,7 +890,7 @@ class TimerControls(discord.ui.View):
 
         clock = clocks[self.channel_id]
         
-        # IMPORTANT: Finalize the current session before stopping
+        # Finalize times
         if clock.active and clock.last_switch:
             elapsed = (datetime.datetime.now(timezone.utc) - clock.last_switch).total_seconds()
             if clock.active == "A":
@@ -717,49 +901,31 @@ class TimerControls(discord.ui.View):
         clock.active = None
         clock.started = False
 
+        # Calculate final DMT scores
+        final_scores = clock.calculate_final_scores()
+        
         # Send final message to game
         if clock.crcon_client:
-            winner_msg = ""
-            if clock.time_a > clock.time_b:
-                winner_msg = "Allies controlled the center longer!"
-            elif clock.time_b > clock.time_a:
-                winner_msg = "Axis controlled the center longer!"
-            else:
-                winner_msg = "Perfect tie - equal control time!"
+            allies_dmt = final_scores['allies']['total_dmt']
+            axis_dmt = final_scores['axis']['total_dmt']
             
-            await clock.crcon_client.send_message(
-                f"🏁 Match Complete! {winner_msg} Allies: {clock.format_time(clock.time_a)} | Axis: {clock.format_time(clock.time_b)}"
-            )
+            if allies_dmt > axis_dmt:
+                winner_msg = f"Allies WIN by DMT Score! {allies_dmt:.1f} - {axis_dmt:.1f}"
+            elif axis_dmt > allies_dmt:
+                winner_msg = f"Axis WIN by DMT Score! {axis_dmt:.1f} - {allies_dmt:.1f}"
+            else:
+                winner_msg = f"DRAW by DMT Score! {allies_dmt:.1f} - {axis_dmt:.1f}"
+            
+            await clock.crcon_client.send_message(f"🏁 Match Complete! {winner_msg}")
 
-        # Create final embed
-        embed = discord.Embed(title="🏁 Match Complete - Time Control Results!", color=0x800020)
+        # Create final embed with DMT scores
+        embed = build_final_dmt_embed(clock, final_scores)
         
-        game_info = clock.get_game_info()
-        if game_info['connection_status'] == 'Connected':
-            embed.add_field(name="🗺️ Map", value=game_info['map'], inline=True)
-            embed.add_field(name="👥 Players", value=f"{game_info['players']}/100", inline=True)
-
-        # Final CONTROL times
-        embed.add_field(name="🇺🇸 Allies Control Time", value=f"`{clock.format_time(clock.time_a)}`", inline=False)
-        embed.add_field(name="🇩🇪 Axis Control Time", value=f"`{clock.format_time(clock.time_b)}`", inline=False)
-        
-        # Determine winner by TIME CONTROL
-        time_diff = abs(clock.time_a - clock.time_b)
-        if clock.time_a > clock.time_b:
-            winner = f"🏆 **Allies Victory**\n*+{clock.format_time(time_diff)} control advantage*"
-        elif clock.time_b > clock.time_a:
-            winner = f"🏆 **Axis Victory**\n*+{clock.format_time(time_diff)} control advantage*"
-        else:
-            winner = "🤝 **Perfect Draw**\n*Equal control time*"
-        
-        embed.add_field(name="🎯 Point Control Winner", value=winner, inline=False)
-        embed.add_field(name="🔄 Total Switches", value=str(len(clock.switches)), inline=True)
-
         await interaction.response.defer()
         await clock.message.edit(embed=embed, view=None)
 
         # Log results
-        await log_results(clock, game_info)
+        await log_dmt_results(clock, final_scores)
 
     async def _switch_team(self, interaction: discord.Interaction, team: str):
         if not user_is_admin(interaction):
@@ -776,39 +942,33 @@ class TimerControls(discord.ui.View):
         }
 
         if not clock.clock_started:
-            # First switch - start the clock
             clock.clock_started = True
             clock.last_switch = now
             clock.active = team
             clock.switches = [switch_data]
         else:
-            # Subsequent switches - accumulate time properly
             elapsed = (now - clock.last_switch).total_seconds()
             
-            # Add elapsed time to the previously active team
             if clock.active == "A":
                 clock.time_a += elapsed
             elif clock.active == "B":
                 clock.time_b += elapsed
             
-            # Switch to new team
             clock.active = team
             clock.last_switch = now
             clock.switches.append(switch_data)
 
-        # Send notification
         if clock.crcon_client:
             team_name = "Allies" if team == "A" else "Axis"
-            # Get current control times for both teams
             allies_time = clock.format_time(clock.total_time('A'))
             axis_time = clock.format_time(clock.total_time('B'))
-            await clock.crcon_client.send_message(f"⚔️ {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}")
+            await clock.crcon_client.send_message(f"⚔️ {team_name} captured! | Allies: {allies_time} | Axis: {axis_time}")
 
         await interaction.response.defer()
         await clock.message.edit(embed=build_embed(clock), view=self)
 
-async def log_results(clock: ClockState, game_info: dict):
-    """Log match results focused on time control"""
+async def log_dmt_results(clock: ClockState, scores: dict):
+    """Log DMT match results"""
     if not LOG_CHANNEL_ID:
         return
         
@@ -816,58 +976,61 @@ async def log_results(clock: ClockState, game_info: dict):
     if not results_channel:
         return
     
-    embed = discord.Embed(title="🏁 HLL Tank Overwatch Match Complete", color=0x800020)
-    embed.add_field(name="🇺🇸 Allies Control Time", value=f"`{clock.format_time(clock.time_a)}`", inline=True)
-    embed.add_field(name="🇩🇪 Axis Control Time", value=f"`{clock.format_time(clock.time_b)}`", inline=True)
+    embed = discord.Embed(title="🏁 DMT Match Complete", color=0x800020)
     
-    # Winner by time control
-    if clock.time_a > clock.time_b:
-        winner = "🏆 Allies"
-        advantage = clock.format_time(clock.time_a - clock.time_b)
-    elif clock.time_b > clock.time_a:
-        winner = "🏆 Axis"
-        advantage = clock.format_time(clock.time_b - clock.time_a)
+    # Quick summary
+    allies_total = scores['allies']['total_dmt']
+    axis_total = scores['axis']['total_dmt']
+    
+    embed.add_field(name="🇺🇸 Allies DMT", value=f"`{allies_total:.1f}`", inline=True)
+    embed.add_field(name="🇩🇪 Axis DMT", value=f"`{axis_total:.1f}`", inline=True)
+    
+    if allies_total > axis_total:
+        winner = f"🏆 Allies (+{allies_total - axis_total:.1f})"
+    elif axis_total > allies_total:
+        winner = f"🏆 Axis (+{axis_total - allies_total:.1f})"
     else:
         winner = "🤝 Draw"
-        advantage = "0:00:00"
     
     embed.add_field(name="Winner", value=winner, inline=True)
-    embed.add_field(name="Advantage", value=f"`+{advantage}`", inline=True)
     
-    if game_info['connection_status'] == 'Connected':
-        embed.add_field(name="🗺️ Map", value=game_info['map'], inline=True)
+    # Breakdown
+    embed.add_field(
+        name="Allies Breakdown",
+        value=f"Combat: `{scores['allies']['total_combat']}`\nCap: `{scores['allies']['total_cap']:.1f}`",
+        inline=True
+    )
+    embed.add_field(
+        name="Axis Breakdown",
+        value=f"Combat: `{scores['axis']['total_combat']}`\nCap: `{scores['axis']['total_cap']:.1f}`",
+        inline=True
+    )
     
-    embed.add_field(name="🔄 Switches", value=str(len(clock.switches)), inline=True)
     embed.timestamp = datetime.datetime.now(timezone.utc)
     
     await results_channel.send(embed=embed)
 
-# Update task - shows in-game time
 @tasks.loop(seconds=int(os.getenv('UPDATE_INTERVAL', '15')))
 async def match_updater(channel_id):
-    """Update match display with live game time"""
+    """Update match display with live game time and scores"""
     clock = clocks.get(channel_id)
     if not clock or not clock.started or not clock.message:
         return
 
     try:
-        # Update from CRCON if connected
         if clock.crcon_client:
             try:
                 await clock.update_from_game()
             except Exception as e:
                 logger.warning(f"CRCON update failed, attempting reconnect: {e}")
-                # Try to reconnect if the session failed
                 await clock.connect_crcon()
 
-        # Check if game has ended (time remaining is 0 or very low)
         game_info = clock.get_game_info()
         if game_info['connection_status'] == 'Connected' and game_info['game_time'] <= 30:
             logger.info("Game time ended, automatically stopping match")
             await auto_stop_match(clock, game_info)
             return
 
-        # Update display with current game time
         try:
             await clock.message.edit(embed=build_embed(clock))
         except discord.HTTPException as e:
@@ -879,7 +1042,6 @@ async def match_updater(channel_id):
 async def auto_stop_match(clock: ClockState, game_info: dict):
     """Automatically stop match when game time ends"""
     try:
-        # IMPORTANT: Finalize the current session before stopping
         if clock.active and clock.last_switch:
             elapsed = (datetime.datetime.now(timezone.utc) - clock.last_switch).total_seconds()
             if clock.active == "A":
@@ -890,53 +1052,34 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
         clock.active = None
         clock.started = False
 
+        # Calculate final DMT scores
+        final_scores = clock.calculate_final_scores()
+        
         # Send final message to game
         if clock.crcon_client:
-            winner_msg = ""
-            if clock.time_a > clock.time_b:
-                winner_msg = "Allies controlled the center longer!"
-            elif clock.time_b > clock.time_a:
-                winner_msg = "Axis controlled the center longer!"
-            else:
-                winner_msg = "Perfect tie - equal control time!"
+            allies_dmt = final_scores['allies']['total_dmt']
+            axis_dmt = final_scores['axis']['total_dmt']
             
-            await clock.crcon_client.send_message(
-                f"🏁 Match Complete! {winner_msg} Allies: {clock.format_time(clock.time_a)} | Axis: {clock.format_time(clock.time_b)}"
-            )
+            if allies_dmt > axis_dmt:
+                winner_msg = f"Allies WIN by DMT Score! {allies_dmt:.1f} - {axis_dmt:.1f}"
+            elif axis_dmt > allies_dmt:
+                winner_msg = f"Axis WIN by DMT Score! {axis_dmt:.1f} - {allies_dmt:.1f}"
+            else:
+                winner_msg = f"DRAW by DMT Score! {allies_dmt:.1f} - {axis_dmt:.1f}"
+            
+            await clock.crcon_client.send_message(f"🏁 Match Complete! {winner_msg}")
 
         # Create final embed
-        embed = discord.Embed(title="🏁 Match Complete - Time Control Results!", color=0x800020)
+        embed = build_final_dmt_embed(clock, final_scores)
         embed.add_field(name="🕐 End Reason", value="⏰ Game Time Expired", inline=False)
-        
-        if game_info['connection_status'] == 'Connected':
-            embed.add_field(name="🗺️ Map", value=game_info['map'], inline=True)
-            embed.add_field(name="👥 Players", value=f"{game_info['players']}/100", inline=True)
 
-        # Final CONTROL times
-        embed.add_field(name="🇺🇸 Allies Control Time", value=f"`{clock.format_time(clock.time_a)}`", inline=False)
-        embed.add_field(name="🇩🇪 Axis Control Time", value=f"`{clock.format_time(clock.time_b)}`", inline=False)
-        
-        # Determine winner by TIME CONTROL
-        time_diff = abs(clock.time_a - clock.time_b)
-        if clock.time_a > clock.time_b:
-            winner = f"🏆 **Allies Victory**\n*+{clock.format_time(time_diff)} control advantage*"
-        elif clock.time_b > clock.time_a:
-            winner = f"🏆 **Axis Victory**\n*+{clock.format_time(time_diff)} control advantage*"
-        else:
-            winner = "🤝 **Perfect Draw**\n*Equal control time*"
-        
-        embed.add_field(name="🎯 Point Control Winner", value=winner, inline=False)
-        embed.add_field(name="🔄 Total Switches", value=str(len(clock.switches)), inline=True)
-
-        # Update the message with final results
         await clock.message.edit(embed=embed, view=None)
         
-        # Also post to the channel (not just edit the existing message)
+        # Post to channel
         channel = clock.message.channel
-        await channel.send("🏁 **MATCH COMPLETE!** 🏁", embed=embed)
+        await channel.send("🏁 **MATCH COMPLETE - DMT SCORES CALCULATED!** 🏁", embed=embed)
 
-        # Log results to log channel
-        await log_results(clock, game_info)
+        await log_dmt_results(clock, final_scores)
         
         logger.info("Match automatically stopped due to game time expiring")
 
@@ -944,198 +1087,61 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
         logger.error(f"Error in auto_stop_match: {e}")
 
 # Bot commands
-@bot.tree.command(name="reverse_clock", description="Start the HLL Tank Overwatch time control clock")
-async def reverse_clock(interaction: discord.Interaction):
+@bot.tree.command(name="dmt_clock", description="Start the HLL Tank Overwatch DMT scoring clock")
+async def dmt_clock(interaction: discord.Interaction):
     channel_id = interaction.channel_id
     clocks[channel_id] = ClockState()
 
     embed = build_embed(clocks[channel_id])
     view = StartControls(channel_id)
 
-    await interaction.response.send_message("✅ HLL Tank Overwatch clock ready!", ephemeral=True)
+    await interaction.response.send_message("✅ HLL Tank Overwatch DMT clock ready!", ephemeral=True)
     posted_message = await interaction.channel.send(embed=embed, view=view)
     clocks[channel_id].message = posted_message
 
-@bot.tree.command(name="crcon_status", description="Check CRCON connection status")
-async def crcon_status(interaction: discord.Interaction):
-    await interaction.response.defer()
+@bot.tree.command(name="help_dmt", description="Show help for the DMT scoring system")
+async def help_dmt(interaction: discord.Interaction):
+    embed = discord.Embed(title="🎯 HLL Tank Overwatch - DMT Scoring Help", color=0x0099ff)
     
-    embed = discord.Embed(title="🔗 CRCON Status", color=0x0099ff)
+    embed.add_field(
+        name="📐 DMT Scoring Formula",
+        value=(
+            "**Total Score = Combat Score + Cap Score**\n\n"
+            "**Combat Score:** (3 × Top 4 Crew Scores) + Cmdr P-Strike\n"
+            "**Cap Score:** Center Point Seconds × 0.5"
+        ),
+        inline=False
+    )
     
-    try:
-        test_client = APIKeyCRCONClient()
-        async with test_client as client:
-            live_data = await client.get_live_game_state()
-            
-            if live_data:
-                game_state = live_data.get('game_state', {})
-                embed.add_field(name="Connection", value="✅ Connected", inline=True)
-                embed.add_field(name="API Key", value="✅ Valid", inline=True)
-                embed.add_field(name="Data", value="✅ Available", inline=True)
-                embed.add_field(name="Current Map", value=game_state.get('current_map', 'Unknown'), inline=True)
-                embed.add_field(name="Players", value=f"{game_state.get('nb_players', 0)}/100", inline=True)
-                embed.add_field(name="Server Status", value="🟢 Online", inline=True)
-            else:
-                embed.add_field(name="Connection", value="🟡 Connected", inline=True)
-                embed.add_field(name="Data", value="❌ No data", inline=True)
-                
-    except Exception as e:
-        embed.add_field(name="Connection", value="❌ Failed", inline=True)
-        embed.add_field(name="Error", value=str(e)[:500], inline=False)
-    
-    # Configuration info
-    embed.add_field(name="URL", value=os.getenv('CRCON_URL', 'Not set'), inline=True)
-    embed.add_field(name="API Key", value=f"{os.getenv('CRCON_API_KEY', 'Not set')[:8]}..." if os.getenv('CRCON_API_KEY') else 'Not set', inline=True)
-    
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="server_info", description="Get current HLL server information")
-async def server_info(interaction: discord.Interaction):
-    await interaction.response.defer()
-    
-    try:
-        test_client = APIKeyCRCONClient()
-        async with test_client as client:
-            live_data = await client.get_live_game_state()
-            
-            if not live_data:
-                return await interaction.followup.send("❌ Could not retrieve server information")
-            
-            embed = discord.Embed(title="🎮 HLL Server Information", color=0x00ff00)
-            
-            game_state = live_data.get('game_state', {})
-            map_info = live_data.get('map_info', {})
-            
-            # Extract map info
-            map_name = 'Unknown'
-            if isinstance(map_info, dict):
-                if 'pretty_name' in map_info:
-                    map_name = map_info['pretty_name']
-                elif 'name' in map_info:
-                    map_name = map_info['name']
-                elif 'map' in map_info and isinstance(map_info['map'], dict):
-                    map_name = map_info['map'].get('pretty_name', map_info['map'].get('name', 'Unknown'))
-            
-            embed.add_field(name="🗺️ Map", value=map_name, inline=True)
-            embed.add_field(name="👥 Players", value=f"{game_state.get('nb_players', 0)}/100", inline=True)
-            
-            if game_state.get('time_remaining', 0) > 0:
-                time_remaining = game_state['time_remaining']
-                embed.add_field(name="⏱️ Game Time", value=f"{time_remaining//60}:{time_remaining%60:02d}", inline=True)
-            
-            embed.timestamp = datetime.datetime.now(timezone.utc)
-            await interaction.followup.send(embed=embed)
-            
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error retrieving server info: {str(e)}")
-
-@bot.tree.command(name="test_map", description="Quick map data test")
-async def test_map(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    
-    try:
-        test_client = APIKeyCRCONClient()
-        async with test_client as client:
-            live_data = await client.get_live_game_state()
-            
-            if not live_data:
-                return await interaction.followup.send("❌ No data")
-            
-            map_info = live_data.get('map_info', {})
-            game_state = live_data.get('game_state', {})
-            
-            msg = f"**Map Info:** {map_info}\n\n**Game State:** {game_state}"
-            
-            # Truncate if too long
-            if len(msg) > 1900:
-                msg = msg[:1900] + "..."
-            
-            await interaction.followup.send(f"```\n{msg}\n```", ephemeral=True)
-            
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@bot.tree.command(name="send_message", description="Send a message to the HLL server")
-async def send_server_message(interaction: discord.Interaction, message: str):
-    if not user_is_admin(interaction):
-        return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    try:
-        test_client = APIKeyCRCONClient()
-        async with test_client as client:
-            success = await client.send_message(f"📢 [Discord] {message}")
-            
-            if success:
-                embed = discord.Embed(
-                    title="📢 Message Sent",
-                    description=f"Successfully sent to server:\n\n*{message}*",
-                    color=0x00ff00
-                )
-            else:
-                embed = discord.Embed(
-                    title="⚠️ Message Not Sent",
-                    description="Message endpoints not available on this CRCON version",
-                    color=0xffaa00
-                )
-            
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-@bot.tree.command(name="help_clock", description="Show help for the time control clock")
-async def help_clock(interaction: discord.Interaction):
-    embed = discord.Embed(title="🎯 HLL Tank Overwatch Clock Help", color=0x0099ff)
+    embed.add_field(
+        name="🎮 How It Works",
+        value=(
+            "1. Track center point control time (already doing)\n"
+            "2. Track combat scores from tank crews\n"
+            "3. Track commander precision strike score\n"
+            "4. Calculate final DMT score at match end\n"
+            "5. Winner = highest DMT total score"
+        ),
+        inline=False
+    )
     
     embed.add_field(
         name="📋 Commands",
         value=(
-            "`/reverse_clock` - Start a new time control clock\n"
-            "`/crcon_status` - Check CRCON connection\n"
-            "`/server_info` - Get current server info\n"
-            "`/send_message` - Send message to server (admin)\n"
-            "`/test_map` - Test map data retrieval\n"
+            "`/dmt_clock` - Start a DMT scoring clock\n"
+            "`/help_dmt` - Show this help message"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="🎮 How to Use",
+        name="💡 Tips",
         value=(
-            "1. Use `/reverse_clock` to create a clock\n"
-            "2. Click **▶️ Start Match** to begin\n"
-            "3. Use **Allies**/**Axis** buttons to switch control\n"
-            "4. Toggle **🤖 Auto** for automatic switching\n"
-            "5. Click **⏹️ Stop** when match ends\n"
+            "• Keep 4 tank crews active for max points\n"
+            "• Commander P-strikes add directly to score\n"
+            "• Every 2 seconds of center control = 1 point\n"
+            "• Balance combat and objective play!"
         ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🏆 How to Win",
-        value=(
-            "**Win by controlling the center point longer!**\n"
-            "• Whoever holds the point accumulates time\n"
-            "• Team with most control time wins\n"
-            "• Captures matter, not kills or other scores"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="⚙️ Auto-Switch",
-        value=(
-            "When enabled, the clock automatically switches teams "
-            "when point captures are detected from the game server."
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="👑 Admin Requirements",
-        value="You need the **Admin** role to control the clock.",
         inline=False
     )
     
@@ -1161,8 +1167,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
 async def on_ready():
     logger.info(f"✅ Bot logged in as {bot.user}")
     logger.info(f"🔗 CRCON URL: {os.getenv('CRCON_URL', 'Not configured')}")
+    logger.info(f"📊 DMT Scoring: {os.getenv('DMT_SCORING', 'true')}")
     
-    # Test CRCON connection on startup
     try:
         test_client = APIKeyCRCONClient()
         async with test_client as client:
@@ -1174,52 +1180,31 @@ async def on_ready():
     except Exception as e:
         logger.warning(f"⚠️ CRCON connection test failed: {e}")
     
-    # Sync commands
     await bot.wait_until_ready()
     try:
         synced = await bot.tree.sync()
         logger.info(f"✅ Synced {len(synced)} slash commands")
-        print(f"🎉 HLL Tank Overwatch Clock ready! Use /reverse_clock to start")
+        print(f"🎉 HLL Tank Overwatch with DMT Scoring ready! Use /dmt_clock to start")
     except Exception as e:
         logger.error(f"❌ Command sync failed: {e}")
 
-# Main execution
 if __name__ == "__main__":
-    print("🚀 Starting HLL Tank Overwatch Bot...")
-    print("📝 Version: Updated with corrected CRCON endpoints")
+    print("🚀 Starting HLL Tank Overwatch Bot with DMT Scoring...")
+    print("📐 DMT Formula: (3×Top4Crews) + CmdrPStrike + (CenterSeconds×0.5)")
     
-    # Check for Discord token
     token = os.getenv("DISCORD_TOKEN")
     if not token or token == "your_discord_bot_token_here":
         print("❌ DISCORD_TOKEN not configured!")
-        print("1. Create a Discord bot at https://discord.com/developers/applications")
-        print("2. Copy the bot token")
-        print("3. Edit .env file and set DISCORD_TOKEN=your_actual_token")
         exit(1)
     
-    # Check for API key
     api_key = os.getenv("CRCON_API_KEY")
     if not api_key or api_key == "your_crcon_api_key_here":
         print("❌ CRCON_API_KEY not configured!")
-        print("Edit .env file and set CRCON_API_KEY=your_crcon_api_key_here")
         exit(1)
     
-    # Show configuration
     print(f"🔗 CRCON: {os.getenv('CRCON_URL', 'http://localhost:8010')}")
-    print(f"🔑 API Key: {api_key[:8]}...")
-    print(f"👑 Admin Role: {os.getenv('ADMIN_ROLE_NAME', 'admin')}")
-    print(f"🤖 Bot Name: {os.getenv('BOT_NAME', 'HLLTankBot')}")
-    print(f"⏱️ Update Interval: {os.getenv('UPDATE_INTERVAL', '15')}s")
+    print(f"📊 DMT Scoring: {os.getenv('DMT_SCORING', 'true')}")
     print(f"🔄 Auto-Switch: {os.getenv('CRCON_AUTO_SWITCH', 'true')}")
-    
-    log_channel = os.getenv('LOG_CHANNEL_ID', '0')
-    if log_channel != '0':
-        print(f"📋 Log Channel: {log_channel}")
-    else:
-        print("📋 Log Channel: Disabled")
-    
-    print("🎯 Focus: TIME CONTROL - Win by holding the center point longest!")
-    print("✅ Endpoint Update: Fixed get_player_ids endpoint")
     
     try:
         bot.run(token)
