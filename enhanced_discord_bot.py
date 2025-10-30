@@ -58,7 +58,7 @@ class PlayerScore:
 class TeamScores:
     """Track team scores for DMT system"""
     def __init__(self):
-        self.crew_scores = []  # List of highest scores from each tank crew
+        self.crew_highest_scores = {}  # squad_name -> highest_score from that crew
         self.commander_score = 0
         self.commander_pstrike_score = 0
         self.center_point_seconds = 0
@@ -69,13 +69,14 @@ class TeamScores:
         
     def calculate_dmt_score(self):
         """Calculate DMT total score"""
-        # Get top 4 crew scores (highest CS from each crew)
-        top_4_crews = sorted(self.crew_scores, reverse=True)[:4]
-        while len(top_4_crews) < 4:
-            top_4_crews.append(0)  # Pad with 0 if less than 4 crews
+        # Get all crew highest scores (one per crew)
+        crew_scores_list = list(self.crew_highest_scores.values())
         
-        # TOTAL COMBAT SCORE = (3 × (sum of top 4 crew scores)) + Commander P-Strike CS
-        self.total_combat_score = (3 * sum(top_4_crews)) + self.commander_pstrike_score
+        # Sum of all crew highest scores (can be any number of crews)
+        sum_of_crew_highest = sum(crew_scores_list) if crew_scores_list else 0
+        
+        # TOTAL COMBAT SCORE = (3 × (sum of highest score from each crew)) + Commander P-Strike CS
+        self.total_combat_score = (3 * sum_of_crew_highest) + self.commander_pstrike_score
         
         # TOTAL CENTER POINT CAP SCORE = seconds × 0.5
         self.total_cap_score = self.center_point_seconds * 0.5
@@ -376,15 +377,18 @@ class ClockState:
                     for team_name, team_data in players_data['teams'].items():
                         team_scores = self.allies_scores if team_name == 'allies' else self.axis_scores
                         
-                        # Track squads for crew identification
-                        squad_scores = {}  # squad_name -> highest_score
+                        # Clear previous crew scores for fresh calculation
+                        team_scores.crew_highest_scores = {}
                         
                         if 'squads' in team_data:
                             for squad_name, squad_data in team_data['squads'].items():
                                 highest_squad_score = 0
+                                squad_player_count = 0
                                 
                                 # Check if this is a tank crew squad (contains "tank" or specific squad names)
-                                is_tank_crew = any(keyword in squad_name.lower() for keyword in ['tank', 'armor', 'crew'])
+                                # Tank crews typically have "tank", "armor", "crew" in name, or are named like "Able", "Baker", etc.
+                                is_tank_crew = any(keyword in squad_name.lower() for keyword in ['tank', 'armor', 'crew']) or \
+                                              squad_name in ['Able', 'Baker', 'Charlie', 'Dog', 'Easy', 'Fox', 'George', 'How', 'Item', 'Jig', 'King', 'Love']
                                 
                                 if 'players' in squad_data:
                                     for player in squad_data['players']:
@@ -414,18 +418,23 @@ class ClockState:
                                             # This might need adjustment based on CRCON data format
                                             team_scores.commander_pstrike_score = player.get('offensive', 0)
                                         
-                                        # Track highest score in tank crew
-                                        if is_tank_crew and combat_score > highest_squad_score:
-                                            highest_squad_score = combat_score
+                                        # Track highest score in this specific tank crew
+                                        if is_tank_crew:
+                                            squad_player_count += 1
+                                            if combat_score > highest_squad_score:
+                                                highest_squad_score = combat_score
                                 
-                                # Add highest crew score
-                                if is_tank_crew and highest_squad_score > 0:
-                                    squad_scores[squad_name] = highest_squad_score
+                                # Store the highest score from this tank crew
+                                # Only count squads that actually have players and are tank crews
+                                if is_tank_crew and squad_player_count > 0:
+                                    team_scores.crew_highest_scores[squad_name] = highest_squad_score
+                                    logger.debug(f"Tank crew {squad_name}: {squad_player_count} players, highest score: {highest_squad_score}")
                         
-                        # Update crew scores list
-                        team_scores.crew_scores = list(squad_scores.values())
-                        
-            logger.debug(f"Updated player scores - Allies crews: {len(self.allies_scores.crew_scores)}, Axis crews: {len(self.axis_scores.crew_scores)}")
+                        # Log crew tracking
+                        logger.debug(f"{team_name.capitalize()} tank crews found: {len(team_scores.crew_highest_scores)}")
+                        if team_scores.crew_highest_scores:
+                            total = sum(team_scores.crew_highest_scores.values())
+                            logger.debug(f"  Crew highest scores: {list(team_scores.crew_highest_scores.values())}, Sum: {total}")
             
         except Exception as e:
             logger.error(f"Error updating player scores: {e}")
@@ -516,7 +525,7 @@ class ClockState:
         return {
             'allies': {
                 'center_seconds': self.allies_scores.center_point_seconds,
-                'crew_scores': self.allies_scores.crew_scores[:4],  # Top 4
+                'crew_scores': list(self.allies_scores.crew_highest_scores.values()),
                 'commander_pstrike': self.allies_scores.commander_pstrike_score,
                 'total_combat': self.allies_scores.total_combat_score,
                 'total_cap': self.allies_scores.total_cap_score,
@@ -524,7 +533,7 @@ class ClockState:
             },
             'axis': {
                 'center_seconds': self.axis_scores.center_point_seconds,
-                'crew_scores': self.axis_scores.crew_scores[:4],  # Top 4
+                'crew_scores': list(self.axis_scores.crew_highest_scores.values()),
                 'commander_pstrike': self.axis_scores.commander_pstrike_score,
                 'total_combat': self.axis_scores.total_combat_score,
                 'total_cap': self.axis_scores.total_cap_score,
@@ -637,10 +646,10 @@ def build_embed(clock: ClockState):
         axis_value += f"\n**Cap Points:** `{axis_cap_score:.1f}`"
         
         # Add crew count if available
-        if len(clock.allies_scores.crew_scores) > 0:
-            allies_value += f"\n**Tank Crews:** `{len(clock.allies_scores.crew_scores)}`"
-        if len(clock.axis_scores.crew_scores) > 0:
-            axis_value += f"\n**Tank Crews:** `{len(clock.axis_scores.crew_scores)}`"
+        if len(clock.allies_scores.crew_highest_scores) > 0:
+            allies_value += f"\n**Tank Crews:** `{len(clock.allies_scores.crew_highest_scores)}`"
+        if len(clock.axis_scores.crew_highest_scores) > 0:
+            axis_value += f"\n**Tank Crews:** `{len(clock.axis_scores.crew_highest_scores)}`"
     
     embed.add_field(name="🇺🇸 Allies", value=allies_value, inline=True)
     embed.add_field(name="🇩🇪 Axis", value=axis_value, inline=True)
@@ -688,7 +697,7 @@ def build_final_dmt_embed(clock: ClockState, scores: dict):
     allies_scores = scores['allies']
     allies_breakdown = f"**Center Point Time:** `{allies_scores['center_seconds']}s`\n"
     allies_breakdown += f"**Cap Score:** `{allies_scores['total_cap']:.1f}` (× 0.5)\n"
-    allies_breakdown += f"**Top 4 Crews:** `{sum(allies_scores['crew_scores'])}`\n"
+    allies_breakdown += f"**Crews ({len(allies_scores['crew_scores'])}):** `{sum(allies_scores['crew_scores'])}`\n"
     allies_breakdown += f"**Combat Score:** `{allies_scores['total_combat']}`\n"
     if allies_scores['commander_pstrike'] > 0:
         allies_breakdown += f"**Cmdr P-Strike:** `{allies_scores['commander_pstrike']}`\n"
@@ -700,7 +709,7 @@ def build_final_dmt_embed(clock: ClockState, scores: dict):
     axis_scores = scores['axis']
     axis_breakdown = f"**Center Point Time:** `{axis_scores['center_seconds']}s`\n"
     axis_breakdown += f"**Cap Score:** `{axis_scores['total_cap']:.1f}` (× 0.5)\n"
-    axis_breakdown += f"**Top 4 Crews:** `{sum(axis_scores['crew_scores'])}`\n"
+    axis_breakdown += f"**Crews ({len(axis_scores['crew_scores'])}):** `{sum(axis_scores['crew_scores'])}`\n"
     axis_breakdown += f"**Combat Score:** `{axis_scores['total_combat']}`\n"
     if axis_scores['commander_pstrike'] > 0:
         axis_breakdown += f"**Cmdr P-Strike:** `{axis_scores['commander_pstrike']}`\n"
@@ -726,7 +735,7 @@ def build_final_dmt_embed(clock: ClockState, scores: dict):
     # Scoring formula reminder
     embed.add_field(
         name="📐 DMT Formula",
-        value="Combat: (3×Top4Crews) + CmdrPStrike | Cap: Seconds×0.5",
+        value="Combat: (3×SumCrewHighest) + CmdrPStrike | Cap: Seconds×0.5",
         inline=False
     )
     
@@ -842,10 +851,13 @@ class TimerControls(discord.ui.View):
                 clock.axis_scores.center_point_seconds = int(clock.total_time('B'))
                 
                 # Calculate preliminary scores
+                allies_crew_sum = sum(clock.allies_scores.crew_highest_scores.values()) if clock.allies_scores.crew_highest_scores else 0
+                axis_crew_sum = sum(clock.axis_scores.crew_highest_scores.values()) if clock.axis_scores.crew_highest_scores else 0
+                
                 allies_prelim = (clock.allies_scores.center_point_seconds * 0.5) + \
-                               (3 * sum(clock.allies_scores.crew_scores[:4]))
+                               (3 * allies_crew_sum) + clock.allies_scores.commander_pstrike_score
                 axis_prelim = (clock.axis_scores.center_point_seconds * 0.5) + \
-                             (3 * sum(clock.axis_scores.crew_scores[:4]))
+                             (3 * axis_crew_sum) + clock.axis_scores.commander_pstrike_score
                 
                 embed.add_field(
                     name="🇺🇸 Allies DMT (Prelim)",
@@ -1107,8 +1119,9 @@ async def help_dmt(interaction: discord.Interaction):
         name="📐 DMT Scoring Formula",
         value=(
             "**Total Score = Combat Score + Cap Score**\n\n"
-            "**Combat Score:** (3 × Top 4 Crew Scores) + Cmdr P-Strike\n"
-            "**Cap Score:** Center Point Seconds × 0.5"
+            "**Combat Score:** (3 × Sum of Highest CS from Each Crew) + Cmdr P-Strike\n"
+            "**Cap Score:** Center Point Seconds × 0.5\n\n"
+            "*Each tank crew has 3 members, we take the highest score from each crew*"
         ),
         inline=False
     )
@@ -1116,8 +1129,8 @@ async def help_dmt(interaction: discord.Interaction):
     embed.add_field(
         name="🎮 How It Works",
         value=(
-            "1. Track center point control time (already doing)\n"
-            "2. Track combat scores from tank crews\n"
+            "1. Track center point control time\n"
+            "2. Track highest combat score from each tank crew\n"
             "3. Track commander precision strike score\n"
             "4. Calculate final DMT score at match end\n"
             "5. Winner = highest DMT total score"
@@ -1137,10 +1150,23 @@ async def help_dmt(interaction: discord.Interaction):
     embed.add_field(
         name="💡 Tips",
         value=(
-            "• Keep 4 tank crews active for max points\n"
+            "• Each crew's best player counts (highest CS)\n"
+            "• More crews = more potential points\n"
             "• Commander P-strikes add directly to score\n"
             "• Every 2 seconds of center control = 1 point\n"
             "• Balance combat and objective play!"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📊 Example Calculation",
+        value=(
+            "**4 Tank Crews with highest scores:** 120, 110, 105, 95\n"
+            "**Sum:** 430 × 3 = 1290 combat points\n"
+            "**Plus:** Commander P-Strike (if any)\n"
+            "**Plus:** Center seconds × 0.5\n"
+            "**= Total DMT Score**"
         ),
         inline=False
     )
@@ -1190,7 +1216,8 @@ async def on_ready():
 
 if __name__ == "__main__":
     print("🚀 Starting HLL Tank Overwatch Bot with DMT Scoring...")
-    print("📐 DMT Formula: (3×Top4Crews) + CmdrPStrike + (CenterSeconds×0.5)")
+    print("📐 DMT Formula: (3×SumOfCrewHighest) + CmdrPStrike + (CenterSeconds×0.5)")
+    print("🎯 Each crew's highest combat score counts (crews of 3 players)")
     
     token = os.getenv("DISCORD_TOKEN")
     if not token or token == "your_discord_bot_token_here":
