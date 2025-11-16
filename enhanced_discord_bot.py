@@ -230,8 +230,8 @@ class ClockState:
         self._first_update_done = False  # Track if first update completed
         self._lock = asyncio.Lock()  # Thread safety for time updates
 
-        # Tournament Mode
-        self.tournament_mode = False
+        # DMT Scoring (always enabled)
+        self.tournament_mode = True  # Always use DMT scoring
         self.team_names = {'allied': 'Allies', 'axis': 'Axis'}
         # Squad mapping: which squads represent which crews
         self.squad_config = {
@@ -427,25 +427,15 @@ class ClockState:
             if not self.clock_started:
                 self.clock_started = True
         
-        # Send notification to game (if messaging works)
+        # Send notification to game with DMT scores
         if self.crcon_client:
             team_name = self.team_names.get('allied' if team == 'A' else 'axis', 'Allies' if team == 'A' else 'Axis')
+            allied_scores = self.calculate_dmt_score('allied')
+            axis_scores = self.calculate_dmt_score('axis')
+            team_a_name = self.team_names['allied']
+            team_b_name = self.team_names['axis']
 
-            if self.tournament_mode:
-                # Show BOTH cap time and DMT scores for tournament with breakdown
-                allied_scores = self.calculate_dmt_score('allied')
-                axis_scores = self.calculate_dmt_score('axis')
-                team_a_name = self.team_names['allied']
-                team_b_name = self.team_names['axis']
-                allies_time = self.format_time(self.total_time('A'))
-                axis_time = self.format_time(self.total_time('B'))
-                msg = f"🔄 {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
-            else:
-                # Show cap times for standard mode
-                allies_time = self.format_time(self.total_time('A'))
-                axis_time = self.format_time(self.total_time('B'))
-                msg = f"🔄 {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}"
-
+            msg = f"🔄 {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
             await self.crcon_client.send_message(msg)
         
         # IMPORTANT: Update the Discord embed immediately
@@ -684,21 +674,11 @@ async def safe_edit_message(message, **kwargs):
         return False
 
 def build_embed(clock: ClockState):
-    """Build Discord embed focused on TIME CONTROL or TOURNAMENT MODE"""
-    # Change title based on mode
-    if clock.tournament_mode:
-        title = "🏆 HLL Tank Tournament - DMT Scoring 🏆"
-        description = "**Win by highest DMT Total Score!**"
-        color = 0xFFD700  # Gold color for tournament
-    else:
-        title = "🎯 🔥 HLL Tank Overwatch 🔥 🎯"
-        description = "**Control the center point to win!**"
-        color = 0x800020
-
+    """Build Discord embed with DMT Scoring"""
     embed = discord.Embed(
-        title=title,
-        description=description,
-        color=color
+        title="🏆 HLL Tank Overwatch - DMT Scoring 🏆",
+        description="**Win by highest DMT Total Score!**",
+        color=0xFFD700  # Gold color
     )
 
     # Add game information
@@ -739,42 +719,31 @@ def build_embed(clock: ClockState):
     embed.add_field(name=f"🇺🇸 {allied_name}", value=allies_value, inline=False)
     embed.add_field(name=f"🇩🇪 {axis_name}", value=axis_value, inline=False)
 
-    # Add tournament DMT scores if enabled
-    if clock.tournament_mode:
-        allied_scores = clock.calculate_dmt_score('allied')
-        axis_scores = clock.calculate_dmt_score('axis')
+    # Calculate and show DMT scores
+    allied_scores = clock.calculate_dmt_score('allied')
+    axis_scores = clock.calculate_dmt_score('axis')
 
-        # Show DMT scores
-        dmt_allied = f"**DMT Score: {allied_scores['total_dmt']:,.1f}**\n"
-        dmt_allied += f"Combat: {allied_scores['combat_total']:,.0f} | Cap: {allied_scores['cap_score']:,.1f}"
+    # Show DMT scores
+    dmt_allied = f"**DMT Score: {allied_scores['total_dmt']:,.1f}**\n"
+    dmt_allied += f"Combat: {allied_scores['combat_total']:,.0f} | Cap: {allied_scores['cap_score']:,.1f}"
 
-        dmt_axis = f"**DMT Score: {axis_scores['total_dmt']:,.1f}**\n"
-        dmt_axis += f"Combat: {axis_scores['combat_total']:,.0f} | Cap: {axis_scores['cap_score']:,.1f}"
+    dmt_axis = f"**DMT Score: {axis_scores['total_dmt']:,.1f}**\n"
+    dmt_axis += f"Combat: {axis_scores['combat_total']:,.0f} | Cap: {axis_scores['cap_score']:,.1f}"
 
-        embed.add_field(name=f"🏆 {allied_name} DMT", value=dmt_allied, inline=True)
-        embed.add_field(name=f"🏆 {axis_name} DMT", value=dmt_axis, inline=True)
+    embed.add_field(name=f"🏆 {allied_name} DMT", value=dmt_allied, inline=True)
+    embed.add_field(name=f"🏆 {axis_name} DMT", value=dmt_axis, inline=True)
 
-        # Tournament leader
-        if allied_scores['total_dmt'] > axis_scores['total_dmt']:
-            diff = allied_scores['total_dmt'] - axis_scores['total_dmt']
-            leader_text = f"🏆 **{allied_name}** leads by {diff:,.1f} points"
-        elif axis_scores['total_dmt'] > allied_scores['total_dmt']:
-            diff = axis_scores['total_dmt'] - allied_scores['total_dmt']
-            leader_text = f"🏆 **{axis_name}** leads by {diff:,.1f} points"
-        else:
-            leader_text = "⚖️ **Tied**"
-
-        embed.add_field(name="📊 Tournament Leader", value=leader_text, inline=False)
+    # Show leader
+    if allied_scores['total_dmt'] > axis_scores['total_dmt']:
+        diff = allied_scores['total_dmt'] - axis_scores['total_dmt']
+        leader_text = f"🏆 **{allied_name}** leads by {diff:,.1f} points"
+    elif axis_scores['total_dmt'] > allied_scores['total_dmt']:
+        diff = axis_scores['total_dmt'] - allied_scores['total_dmt']
+        leader_text = f"🏆 **{axis_name}** leads by {diff:,.1f} points"
     else:
-        # Add current leader status (non-tournament mode)
-        if allies_status['total_time'] > axis_status['total_time']:
-            leader_text = f"🏆 **Current Leader:** {allied_name}"
-        elif axis_status['total_time'] > allies_status['total_time']:
-            leader_text = f"🏆 **Current Leader:** {axis_name}"
-        else:
-            leader_text = "⚖️ **Status:** Tied"
+        leader_text = "⚖️ **Tied**"
 
-        embed.add_field(name="🎯 Point Control", value=leader_text, inline=False)
+    embed.add_field(name="📊 Current Leader", value=leader_text, inline=False)
     
     # Footer with connection status
     connection_status = f"🟢 CRCON Connected" if clock.crcon_client else "🔴 CRCON Disconnected"
@@ -820,13 +789,10 @@ class StartControls(discord.ui.View):
         if crcon_connected:
             clock.auto_switch = os.getenv('CRCON_AUTO_SWITCH', 'false').lower() == 'true'
 
-            # Send appropriate start message based on mode
-            if clock.tournament_mode:
-                team_a = clock.team_names['allied']
-                team_b = clock.team_names['axis']
-                start_msg = f"🏆 TOURNAMENT MATCH: {team_a} vs {team_b} | DMT Scoring Active | Combat + Cap Time = Total Score"
-            else:
-                start_msg = "🎯 HLL Tank Overwatch Match Started! Center point control timer active."
+            # Send start message with DMT scoring info
+            team_a = clock.team_names['allied']
+            team_b = clock.team_names['axis']
+            start_msg = f"🏆 HLL Tank Overwatch: {team_a} vs {team_b} | DMT Scoring Active | Combat + Cap Time = Total Score"
 
             await clock.crcon_client.send_message(start_msg)
             await interaction.edit_original_response(content="✅ Match started with CRCON!")
@@ -973,40 +939,23 @@ class TimerControls(discord.ui.View):
             clock.active = None
             clock.started = False
 
-        # Send final message to game
+        # Send final message to game with DMT scores
         if clock.crcon_client:
-            if clock.tournament_mode:
-                # Show BOTH cap time and DMT scores for tournament with breakdown
-                allied_scores = clock.calculate_dmt_score('allied')
-                axis_scores = clock.calculate_dmt_score('axis')
-                team_a_name = clock.team_names['allied']
-                team_b_name = clock.team_names['axis']
-                allies_time = clock.format_time(clock.time_a)
-                axis_time = clock.format_time(clock.time_b)
+            allied_scores = clock.calculate_dmt_score('allied')
+            axis_scores = clock.calculate_dmt_score('axis')
+            team_a_name = clock.team_names['allied']
+            team_b_name = clock.team_names['axis']
 
-                if allied_scores['total_dmt'] > axis_scores['total_dmt']:
-                    winner_msg = f"{team_a_name} WINS!"
-                elif axis_scores['total_dmt'] > allied_scores['total_dmt']:
-                    winner_msg = f"{team_b_name} WINS!"
-                else:
-                    winner_msg = "DRAW!"
-
-                await clock.crcon_client.send_message(
-                    f"🏁 TOURNAMENT COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
-                )
+            if allied_scores['total_dmt'] > axis_scores['total_dmt']:
+                winner_msg = f"{team_a_name} WINS!"
+            elif axis_scores['total_dmt'] > allied_scores['total_dmt']:
+                winner_msg = f"{team_b_name} WINS!"
             else:
-                # Standard mode - show cap times
-                winner_msg = ""
-                if clock.time_a > clock.time_b:
-                    winner_msg = "Allies controlled the center longer!"
-                elif clock.time_b > clock.time_a:
-                    winner_msg = "Axis controlled the center longer!"
-                else:
-                    winner_msg = "Perfect tie - equal control time!"
+                winner_msg = "DRAW!"
 
-                await clock.crcon_client.send_message(
-                    f"🏁 Match Complete! {winner_msg} Allies: {clock.format_time(clock.time_a)} | Axis: {clock.format_time(clock.time_b)}"
-                )
+            await clock.crcon_client.send_message(
+                f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
+            )
 
         # Create final embed
         embed = discord.Embed(title="🏁 Match Complete - Time Control Results!", color=0x800020)
@@ -1075,25 +1024,15 @@ class TimerControls(discord.ui.View):
                 clock.last_switch = now
                 clock.switches.append(switch_data)
 
-        # Send notification
+        # Send notification with DMT scores
         if clock.crcon_client:
             team_name = clock.team_names.get('allied' if team == 'A' else 'axis', 'Allies' if team == 'A' else 'Axis')
+            allied_scores = clock.calculate_dmt_score('allied')
+            axis_scores = clock.calculate_dmt_score('axis')
+            team_a_name = clock.team_names['allied']
+            team_b_name = clock.team_names['axis']
 
-            if clock.tournament_mode:
-                # Show BOTH cap time and DMT scores for tournament with breakdown
-                allied_scores = clock.calculate_dmt_score('allied')
-                axis_scores = clock.calculate_dmt_score('axis')
-                team_a_name = clock.team_names['allied']
-                team_b_name = clock.team_names['axis']
-                allies_time = clock.format_time(clock.total_time('A'))
-                axis_time = clock.format_time(clock.total_time('B'))
-                msg = f"⚔️ {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
-            else:
-                # Show cap times for standard mode
-                allies_time = clock.format_time(clock.total_time('A'))
-                axis_time = clock.format_time(clock.total_time('B'))
-                msg = f"⚔️ {team_name} captured the center point! | Allies: {allies_time} | Axis: {axis_time}"
-
+            msg = f"⚔️ {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
             await clock.crcon_client.send_message(msg)
 
         await interaction.response.defer()
@@ -1193,40 +1132,23 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
             clock.active = None
             clock.started = False
 
-        # Send final message to game
+        # Send final message to game with DMT scores
         if clock.crcon_client:
-            if clock.tournament_mode:
-                # Show BOTH cap time and DMT scores for tournament with breakdown
-                allied_scores = clock.calculate_dmt_score('allied')
-                axis_scores = clock.calculate_dmt_score('axis')
-                team_a_name = clock.team_names['allied']
-                team_b_name = clock.team_names['axis']
-                allies_time = clock.format_time(clock.time_a)
-                axis_time = clock.format_time(clock.time_b)
+            allied_scores = clock.calculate_dmt_score('allied')
+            axis_scores = clock.calculate_dmt_score('axis')
+            team_a_name = clock.team_names['allied']
+            team_b_name = clock.team_names['axis']
 
-                if allied_scores['total_dmt'] > axis_scores['total_dmt']:
-                    winner_msg = f"{team_a_name} WINS!"
-                elif axis_scores['total_dmt'] > allied_scores['total_dmt']:
-                    winner_msg = f"{team_b_name} WINS!"
-                else:
-                    winner_msg = "DRAW!"
-
-                await clock.crcon_client.send_message(
-                    f"🏁 TOURNAMENT COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
-                )
+            if allied_scores['total_dmt'] > axis_scores['total_dmt']:
+                winner_msg = f"{team_a_name} WINS!"
+            elif axis_scores['total_dmt'] > allied_scores['total_dmt']:
+                winner_msg = f"{team_b_name} WINS!"
             else:
-                # Standard mode - show cap times
-                winner_msg = ""
-                if clock.time_a > clock.time_b:
-                    winner_msg = "Allies controlled the center longer!"
-                elif clock.time_b > clock.time_a:
-                    winner_msg = "Axis controlled the center longer!"
-                else:
-                    winner_msg = "Perfect tie - equal control time!"
+                winner_msg = "DRAW!"
 
-                await clock.crcon_client.send_message(
-                    f"🏁 Match Complete! {winner_msg} Allies: {clock.format_time(clock.time_a)} | Axis: {clock.format_time(clock.time_b)}"
-                )
+            await clock.crcon_client.send_message(
+                f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
+            )
 
         # Create final embed
         embed = discord.Embed(title="🏁 Match Complete - Time Control Results!", color=0x800020)
@@ -1481,9 +1403,9 @@ async def send_server_message(interaction: discord.Interaction, message: str):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-@bot.tree.command(name="tournament_mode", description="Enable/disable tournament mode with DMT scoring")
-async def tournament_mode_cmd(interaction: discord.Interaction, enabled: bool, team_a: str = "Team A", team_b: str = "Team B"):
-    """Enable tournament mode with DMT scoring"""
+@bot.tree.command(name="set_team_names", description="Set custom team names for the match")
+async def set_team_names_cmd(interaction: discord.Interaction, team_a: str = "Allies", team_b: str = "Axis"):
+    """Set custom team names for DMT scoring display"""
     if not user_is_admin(interaction):
         return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
 
@@ -1492,19 +1414,14 @@ async def tournament_mode_cmd(interaction: discord.Interaction, enabled: bool, t
         return await interaction.response.send_message("❌ No active clock in this channel. Use /reverse_clock first.", ephemeral=True)
 
     clock = clocks[channel_id]
-    clock.tournament_mode = enabled
     clock.team_names['allied'] = team_a
     clock.team_names['axis'] = team_b
 
-    if enabled:
-        embed = discord.Embed(title="🏆 Tournament Mode Enabled", color=0x00ff00)
-        embed.add_field(name="Allied Team", value=team_a, inline=True)
-        embed.add_field(name="Axis Team", value=team_b, inline=True)
-        embed.add_field(name="Scoring", value="DMT Total Score", inline=False)
-        embed.add_field(name="Formula", value="Combat Score + Cap Score\nCombat = 3×(Crew1+Crew2+Crew3+Crew4) + Commander\nCap = Seconds × 0.5", inline=False)
-    else:
-        embed = discord.Embed(title="⏱️ Standard Mode Enabled", color=0x0099ff)
-        embed.add_field(name="Scoring", value="Time Control Only", inline=False)
+    embed = discord.Embed(title="✅ Team Names Updated", color=0x00ff00)
+    embed.add_field(name="Allied Team", value=team_a, inline=True)
+    embed.add_field(name="Axis Team", value=team_b, inline=True)
+    embed.add_field(name="Scoring", value="DMT Total Score (Always Active)", inline=False)
+    embed.add_field(name="Formula", value="Combat: 3×(Crew1+Crew2+Crew3+Crew4) + Commander\nCap: Seconds × 0.5\nTotal DMT: Combat + Cap", inline=False)
 
     await interaction.response.send_message(embed=embed)
 
@@ -1547,17 +1464,14 @@ async def set_crew_squads(
 
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="tournament_scores", description="Show current DMT scores")
-async def tournament_scores(interaction: discord.Interaction):
-    """Display current tournament scores"""
+@bot.tree.command(name="dmt_scores", description="Show current DMT scores")
+async def dmt_scores(interaction: discord.Interaction):
+    """Display current DMT scores"""
     channel_id = interaction.channel_id
     if channel_id not in clocks:
         return await interaction.response.send_message("❌ No active clock in this channel.", ephemeral=True)
 
     clock = clocks[channel_id]
-    if not clock.tournament_mode:
-        return await interaction.response.send_message("❌ Tournament mode is not enabled.", ephemeral=True)
-
     await interaction.response.defer()
 
     # Calculate DMT scores
