@@ -957,28 +957,42 @@ class TimerControls(discord.ui.View):
                 f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
             )
 
-        # Create final embed
-        embed = discord.Embed(title="🏁 Match Complete - Time Control Results!", color=0x800020)
-        
+        # Create final embed with DMT scores
+        allied_scores = clock.calculate_dmt_score('allied')
+        axis_scores = clock.calculate_dmt_score('axis')
+        team_a_name = clock.team_names['allied']
+        team_b_name = clock.team_names['axis']
+
+        embed = discord.Embed(title="🏁 Match Complete - DMT Results!", color=0xFFD700)
+
         game_info = clock.get_game_info()
         if game_info['connection_status'] == 'Connected':
             embed.add_field(name="🗺️ Map", value=game_info['map'], inline=True)
             embed.add_field(name="👥 Players", value=f"{game_info['players']}/100", inline=True)
 
-        # Final CONTROL times
-        embed.add_field(name="🇺🇸 Allies Control Time", value=f"`{clock.format_time(clock.time_a)}`", inline=False)
-        embed.add_field(name="🇩🇪 Axis Control Time", value=f"`{clock.format_time(clock.time_b)}`", inline=False)
-        
-        # Determine winner by TIME CONTROL
-        time_diff = abs(clock.time_a - clock.time_b)
-        if clock.time_a > clock.time_b:
-            winner = f"🏆 **Allies Victory**\n*+{clock.format_time(time_diff)} control advantage*"
-        elif clock.time_b > clock.time_a:
-            winner = f"🏆 **Axis Victory**\n*+{clock.format_time(time_diff)} control advantage*"
+        # Final DMT scores
+        embed.add_field(
+            name=f"🇺🇸 {team_a_name} - Final DMT",
+            value=f"**{allied_scores['total_dmt']:,.1f} DMT**\nCombat: {allied_scores['combat_total']:,.0f}\nCap: {allied_scores['cap_score']:,.1f} ({clock.format_time(clock.time_a)})",
+            inline=True
+        )
+        embed.add_field(
+            name=f"🇩🇪 {team_b_name} - Final DMT",
+            value=f"**{axis_scores['total_dmt']:,.1f} DMT**\nCombat: {axis_scores['combat_total']:,.0f}\nCap: {axis_scores['cap_score']:,.1f} ({clock.format_time(clock.time_b)})",
+            inline=True
+        )
+
+        # Determine winner by DMT score
+        if allied_scores['total_dmt'] > axis_scores['total_dmt']:
+            dmt_diff = allied_scores['total_dmt'] - axis_scores['total_dmt']
+            winner = f"🏆 **{team_a_name} Victory**\n*+{dmt_diff:,.1f} DMT advantage*"
+        elif axis_scores['total_dmt'] > allied_scores['total_dmt']:
+            dmt_diff = axis_scores['total_dmt'] - allied_scores['total_dmt']
+            winner = f"🏆 **{team_b_name} Victory**\n*+{dmt_diff:,.1f} DMT advantage*"
         else:
-            winner = "🤝 **Perfect Draw**\n*Equal control time*"
-        
-        embed.add_field(name="🎯 Point Control Winner", value=winner, inline=False)
+            winner = "🤝 **Perfect Draw**\n*Equal DMT scores*"
+
+        embed.add_field(name="🎯 DMT Winner", value=winner, inline=False)
         embed.add_field(name="🔄 Total Switches", value=str(len(clock.switches)), inline=True)
 
         await interaction.response.defer()
@@ -1150,28 +1164,42 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
                 f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
             )
 
-        # Create final embed
-        embed = discord.Embed(title="🏁 Match Complete - Time Control Results!", color=0x800020)
+        # Create final embed with DMT scores
+        allied_scores = clock.calculate_dmt_score('allied')
+        axis_scores = clock.calculate_dmt_score('axis')
+        team_a_name = clock.team_names['allied']
+        team_b_name = clock.team_names['axis']
+
+        embed = discord.Embed(title="🏁 Match Complete - DMT Results!", color=0xFFD700)
         embed.add_field(name="🕐 End Reason", value="⏰ Game Time Expired", inline=False)
-        
+
         if game_info['connection_status'] == 'Connected':
             embed.add_field(name="🗺️ Map", value=game_info['map'], inline=True)
             embed.add_field(name="👥 Players", value=f"{game_info['players']}/100", inline=True)
 
-        # Final CONTROL times
-        embed.add_field(name="🇺🇸 Allies Control Time", value=f"`{clock.format_time(clock.time_a)}`", inline=False)
-        embed.add_field(name="🇩🇪 Axis Control Time", value=f"`{clock.format_time(clock.time_b)}`", inline=False)
-        
-        # Determine winner by TIME CONTROL
-        time_diff = abs(clock.time_a - clock.time_b)
-        if clock.time_a > clock.time_b:
-            winner = f"🏆 **Allies Victory**\n*+{clock.format_time(time_diff)} control advantage*"
-        elif clock.time_b > clock.time_a:
-            winner = f"🏆 **Axis Victory**\n*+{clock.format_time(time_diff)} control advantage*"
+        # Final DMT scores
+        embed.add_field(
+            name=f"🇺🇸 {team_a_name} - Final DMT",
+            value=f"**{allied_scores['total_dmt']:,.1f} DMT**\nCombat: {allied_scores['combat_total']:,.0f}\nCap: {allied_scores['cap_score']:,.1f} ({clock.format_time(clock.time_a)})",
+            inline=True
+        )
+        embed.add_field(
+            name=f"🇩🇪 {team_b_name} - Final DMT",
+            value=f"**{axis_scores['total_dmt']:,.1f} DMT**\nCombat: {axis_scores['combat_total']:,.0f}\nCap: {axis_scores['cap_score']:,.1f} ({clock.format_time(clock.time_b)})",
+            inline=True
+        )
+
+        # Determine winner by DMT score
+        if allied_scores['total_dmt'] > axis_scores['total_dmt']:
+            dmt_diff = allied_scores['total_dmt'] - axis_scores['total_dmt']
+            winner = f"🏆 **{team_a_name} Victory**\n*+{dmt_diff:,.1f} DMT advantage*"
+        elif axis_scores['total_dmt'] > allied_scores['total_dmt']:
+            dmt_diff = axis_scores['total_dmt'] - allied_scores['total_dmt']
+            winner = f"🏆 **{team_b_name} Victory**\n*+{dmt_diff:,.1f} DMT advantage*"
         else:
-            winner = "🤝 **Perfect Draw**\n*Equal control time*"
-        
-        embed.add_field(name="🎯 Point Control Winner", value=winner, inline=False)
+            winner = "🤝 **Perfect Draw**\n*Equal DMT scores*"
+
+        embed.add_field(name="🎯 DMT Winner", value=winner, inline=False)
         embed.add_field(name="🔄 Total Switches", value=str(len(clock.switches)), inline=True)
 
         # Update the message with final results
