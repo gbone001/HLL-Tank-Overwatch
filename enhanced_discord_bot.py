@@ -616,11 +616,14 @@ class ClockState:
         player_name = player_data.get('player', player_data.get('name', 'Unknown'))
         combat_score = player_data.get('combat', player_data.get('combat_score', 0))
 
-        # Store player score by squad
-        if squad_name not in self.player_scores[team_key]:
-            self.player_scores[team_key][squad_name] = []
+        # Normalize squad name to lowercase for case-insensitive matching
+        squad_name_lower = squad_name.lower() if squad_name else 'unknown'
 
-        self.player_scores[team_key][squad_name].append({
+        # Store player score by squad
+        if squad_name_lower not in self.player_scores[team_key]:
+            self.player_scores[team_key][squad_name_lower] = []
+
+        self.player_scores[team_key][squad_name_lower].append({
             'name': player_name,
             'combat_score': combat_score
         })
@@ -640,8 +643,9 @@ class ClockState:
             crew_key = f'crew{crew_num}'
             squad_name = squad_config.get(crew_key, '')
 
-            # Get all players in this squad
-            squad_players = player_scores.get(squad_name, [])
+            # Get all players in this squad (case-insensitive lookup)
+            squad_name_lower = squad_name.lower() if squad_name else ''
+            squad_players = player_scores.get(squad_name_lower, [])
 
             if squad_players:
                 # Find highest combat score in this crew
@@ -650,9 +654,10 @@ class ClockState:
             else:
                 crew_scores.append(0)
 
-        # Get commander score
+        # Get commander score (case-insensitive lookup)
         commander_squad = squad_config.get('commander', '')
-        commander_players = player_scores.get(commander_squad, [])
+        commander_squad_lower = commander_squad.lower() if commander_squad else ''
+        commander_players = player_scores.get(commander_squad_lower, [])
         commander_score = max((p['combat_score'] for p in commander_players), default=0)
 
         # Calculate combat total
