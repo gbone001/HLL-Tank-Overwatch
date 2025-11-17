@@ -343,7 +343,7 @@ class ClockState:
 
             # Only check for auto-switch if we have previous scores to compare
             # This prevents false triggers on first connection
-            if self.auto_switch and self.started and hasattr(self, '_first_update_done'):
+            if self.auto_switch and self.started and self._first_update_done and self.clock_started:
                 await self._check_score_changes()
             else:
                 # First update - just store the scores without triggering auto-switch
