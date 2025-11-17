@@ -1367,7 +1367,7 @@ async def server_info(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error retrieving server info: {str(e)}")
 
-@bot.tree.command(name="test_map", description="Quick map data test")
+@bot.tree.command(name="test_map", description="Debug game state and player count")
 async def test_map(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
@@ -1377,18 +1377,39 @@ async def test_map(interaction: discord.Interaction):
             live_data = await client.get_live_game_state()
 
             if not live_data:
-                return await interaction.followup.send("❌ No data")
+                return await interaction.followup.send("❌ No data", ephemeral=True)
 
-            map_info = live_data.get('map_info', {})
             game_state = live_data.get('game_state', {})
 
-            msg = f"**Map Info:** {map_info}\n\n**Game State:** {game_state}"
+            # Format game_state data
+            import json
+            game_state_str = json.dumps(game_state, indent=2)
 
-            # Truncate if too long
-            if len(msg) > MESSAGE_TRUNCATE_LENGTH:
-                msg = msg[:MESSAGE_TRUNCATE_LENGTH] + "..."
+            # Send overview
+            embed = discord.Embed(title="📊 Game State Debug", color=0x00ff00)
+            embed.add_field(name="Data Type", value=str(type(game_state)), inline=True)
 
-            await interaction.followup.send(f"```\n{msg}\n```", ephemeral=True)
+            if isinstance(game_state, dict):
+                embed.add_field(name="Top Keys", value=str(list(game_state.keys())[:10]), inline=False)
+
+                # Try to extract player count different ways
+                if 'result' in game_state:
+                    result = game_state['result']
+                    if isinstance(result, dict):
+                        embed.add_field(name="Result Keys", value=str(list(result.keys())[:15]), inline=False)
+
+                        # Show player count fields
+                        player_fields = {k: v for k, v in result.items() if 'player' in k.lower() or 'num' in k.lower()}
+                        if player_fields:
+                            embed.add_field(name="Player-related Fields", value=str(player_fields), inline=False)
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+            # Send raw data in chunks
+            chunk_size = 1900
+            for i in range(0, min(len(game_state_str), 3800), chunk_size):  # Max 2 messages
+                chunk = game_state_str[i:i+chunk_size]
+                await interaction.followup.send(f"```json\n{chunk}\n```", ephemeral=True)
 
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
