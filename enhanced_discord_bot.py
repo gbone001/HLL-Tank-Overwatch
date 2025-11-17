@@ -533,12 +533,34 @@ class ClockState:
         if isinstance(detailed_players, dict) and 'result' in detailed_players:
             result = detailed_players['result']
 
-            # Process players - structure is usually {'players': {'allied': [...], 'axis': [...]}}
-            if isinstance(result, dict):
-                # Check for nested players dict
-                if 'players' in result:
-                    players_data = result['players']
-                    if isinstance(players_data, dict):
+            # Process players - handle format where players are keyed by player_id
+            if isinstance(result, dict) and 'players' in result:
+                players_data = result['players']
+
+                # Check if players are keyed by player_id (dict format)
+                if isinstance(players_data, dict):
+                    # Check if it looks like player_id keys (not 'allied'/'axis' keys)
+                    first_key = next(iter(players_data.keys()), None) if players_data else None
+                    if first_key and first_key not in ['allied', 'axis', 'allies']:
+                        # Players keyed by player_id - iterate and organize by team
+                        for player_id, player_data in players_data.items():
+                            if isinstance(player_data, dict):
+                                # Get team - normalize "allies" to "allied"
+                                team = player_data.get('team', '')
+                                if team == 'allies':
+                                    team_key = 'allied'
+                                elif team == 'axis':
+                                    team_key = 'axis'
+                                else:
+                                    continue  # Skip if no valid team
+
+                                # Get squad/unit name
+                                squad_name = player_data.get('unit_name', player_data.get('unit', 'Unknown'))
+
+                                # Add player score
+                                self._add_player_score(player_data, squad_name, team_key)
+                    else:
+                        # Players organized by team
                         self._process_team_scores(players_data.get('allied', []), 'allied')
                         self._process_team_scores(players_data.get('axis', []), 'axis')
                 # Or direct allied/axis keys
