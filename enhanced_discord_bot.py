@@ -484,6 +484,17 @@ class ClockState:
                 allied_players = result.get('num_allied_players', 0)
                 axis_players = result.get('num_axis_players', 0)
                 player_count = allied_players + axis_players
+
+        # Fallback: If game_state returns 0 players, count from detailed_players
+        if player_count == 0:
+            detailed_players = self.game_data.get('detailed_players', {})
+            if isinstance(detailed_players, dict) and 'result' in detailed_players:
+                result = detailed_players['result']
+                if isinstance(result, dict) and 'players' in result:
+                    players_data = result['players']
+                    if isinstance(players_data, dict):
+                        # Count players in the dictionary
+                        player_count = len(players_data)
         
         # Extract game time from your CRCON result format - convert to remaining time display
         game_time_remaining = 0
