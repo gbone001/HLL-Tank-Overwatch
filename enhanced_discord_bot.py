@@ -1382,14 +1382,25 @@ async def test_player_scores(interaction: discord.Interaction):
 
             detailed_players = live_data['detailed_players']
 
-            embed = discord.Embed(title="📊 CRCON Detailed Player Data", color=0x00ff00)
-            embed.add_field(name="✅ Endpoint", value="/api/get_detailed_players", inline=False)
+            # Format data structure overview
+            import json
+            data_str = json.dumps(detailed_players, indent=2)
 
-            # Show sample of what's available
-            msg = f"```json\n{str(detailed_players)[:MESSAGE_TRUNCATE_LENGTH]}```"
-            embed.add_field(name="Sample Data", value=msg, inline=False)
+            # Send first chunk as embed with overview
+            embed = discord.Embed(title="📊 CRCON Player Data Structure", color=0x00ff00)
+            embed.add_field(name="✅ Endpoint", value="/api/get_detailed_players", inline=False)
+            embed.add_field(name="Data Type", value=str(type(detailed_players)), inline=True)
+
+            if isinstance(detailed_players, dict):
+                embed.add_field(name="Top-level Keys", value=str(list(detailed_players.keys())[:10]), inline=False)
 
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+            # Send raw data in chunks (Discord has 2000 char limit per message)
+            chunk_size = 1900
+            for i in range(0, min(len(data_str), 5700), chunk_size):  # Max 3 messages
+                chunk = data_str[i:i+chunk_size]
+                await interaction.followup.send(f"```json\n{chunk}\n```", ephemeral=True)
 
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
