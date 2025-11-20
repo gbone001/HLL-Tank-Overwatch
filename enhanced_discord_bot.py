@@ -6,13 +6,16 @@ Updated with corrected CRCON API endpoints
 """
 
 import asyncio
+import inspect
 import os
 import discord
 import datetime
 import json
 import aiohttp
 import logging
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Awaitable, Callable, List, Optional
 from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -41,6 +44,9 @@ GAME_END_THRESHOLD = 30  # Stop match when server time is below this
 MESSAGE_TRUNCATE_LENGTH = 1900  # Max length for test messages
 MIN_UPDATE_INTERVAL = 5  # Minimum seconds between updates
 MAX_UPDATE_INTERVAL = 300  # Maximum seconds between updates
+ENABLE_KILL_FEED = os.getenv('ENABLE_KILL_FEED', 'false').lower() == 'true'
+CRCON_WS_URL = os.getenv('CRCON_WS_URL', '').strip()
+CRCON_WS_TOKEN = os.getenv('CRCON_WS_TOKEN')
 
 intents = discord.Intents.default()
 intents.message_content = False
@@ -62,30 +68,55 @@ class APIKeyCRCONClient:
     
     async def __aenter__(self):
         """Async context manager entry"""
-        headers = {
-            'Authorization': f'Bearer {self.api_key}',
+        if not self.api_key:
+            raise Exception("CRCON_API_KEY not configured")
+
+        # Support both Bearer and x-api-key header styles - some CRCON builds expect one or the other
+        base_headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         }
-        
-        self.session = aiohttp.ClientSession(
-            timeout=self.timeout,
-            headers=headers
-        )
-        
-        # Test connection
-        try:
-            async with self.session.get(f"{self.base_url}/api/get_status") as response:
-                if response.status != 200:
-                    await self.session.close()
-                    raise Exception(f"CRCON connection failed: {response.status}")
-        except Exception as e:
+        header_variants = [
+            ("bearer", {**base_headers, 'Authorization': f'Bearer {self.api_key}'}),
+            ("x-api-key", {**base_headers, 'x-api-key': self.api_key}),
+            ("raw-authorization", {**base_headers, 'Authorization': self.api_key})
+        ]
+
+        last_status = None
+        last_error = None
+
+        for variant_name, headers in header_variants:
+            # Close any previous session before trying next header style
             if self.session:
                 await self.session.close()
-            raise e
-        
-        logger.info("Successfully connected to CRCON with API key")
-        return self
+
+            self.session = aiohttp.ClientSession(timeout=self.timeout, headers=headers)
+
+            try:
+                async with self.session.get(f"{self.base_url}/api/get_status") as response:
+                    last_status = response.status
+                    if response.status == 200:
+                        logger.info(f"Successfully connected to CRCON with {variant_name} auth header")
+                        return self
+                    if response.status in (401, 403):
+                        logger.warning(f"CRCON {variant_name} auth rejected with {response.status}, trying fallback")
+                        continue
+                    # Other failures are treated as hard errors
+                    raise Exception(f"CRCON connection failed: {response.status}")
+            except Exception as e:
+                last_error = e
+                logger.debug(f"Error during CRCON connect with {variant_name} headers: {e}")
+                continue
+
+        # If we exhausted all header variants without success, clean up and raise a meaningful error
+        if self.session:
+            await self.session.close()
+
+        if last_status in (401, 403):
+            raise Exception("CRCON connection failed: unauthorized (tried Bearer, x-api-key, and Authorization headers). Verify API key and CRCON API access.")
+        if last_error:
+            raise last_error
+        raise Exception("CRCON connection failed: unknown error while negotiating authentication")
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit"""
@@ -205,6 +236,154 @@ class APIKeyCRCONClient:
         except Exception as e:
             logger.error(f"Error sending message to all players: {e}")
             return False
+
+@dataclass
+class KillFeedEvent:
+    raw: str
+    payload: Any
+    received_at: datetime.datetime
+
+
+KillFeedCallback = Callable[[KillFeedEvent], Optional[Awaitable[None]]]
+
+
+class KillFeedListener:
+    """Consumes the CRCON WebSocket kill feed and fans out events."""
+
+    def __init__(self, url: str, token: str):
+        self.url = url
+        self.token = token or ""
+        self._task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event()
+        self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._callbacks: List[KillFeedCallback] = []
+        self._connected = asyncio.Event()
+
+    @property
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def start(self):
+        if self.is_running:
+            return
+        self._stop_event.clear()
+        self._task = asyncio.create_task(self._run(), name="crcon-kill-feed")
+
+    async def stop(self):
+        self._stop_event.set()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+
+    def subscribe(self, callback: KillFeedCallback):
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
+
+    def unsubscribe(self, callback: KillFeedCallback):
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+
+    def get_queue(self) -> asyncio.Queue:
+        return self._event_queue
+
+    async def wait_until_connected(self, timeout: Optional[float] = None) -> bool:
+        try:
+            await asyncio.wait_for(self._connected.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _run(self):
+        backoff = 5
+        while not self._stop_event.is_set():
+            try:
+                headers = {'Authorization': f'Bearer {self.token}'} if self.token else {}
+                async with aiohttp.ClientSession(headers=headers) as session:
+                    logger.info(f"Connecting to CRCON kill feed at {self.url}")
+                    async with session.ws_connect(self.url, heartbeat=30) as ws:
+                        logger.info("Kill feed connected")
+                        self._connected.set()
+                        backoff = 5
+                        async for msg in ws:
+                            if self._stop_event.is_set():
+                                break
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                event = self._build_event(msg.data)
+                                await self._dispatch(event)
+                            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
+                                break
+                self._connected.clear()
+                if self._stop_event.is_set():
+                    break
+                logger.warning(f"Kill feed disconnected, retrying in {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._connected.clear()
+                if self._stop_event.is_set():
+                    break
+                logger.warning(f"Kill feed error: {e}. Retrying in {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+        logger.info("Kill feed listener stopped")
+
+    def _build_event(self, raw_data: str) -> KillFeedEvent:
+        payload: Any = None
+        cleaned = raw_data.strip() if raw_data else ""
+        if cleaned:
+            try:
+                payload = json.loads(cleaned)
+            except json.JSONDecodeError:
+                payload = cleaned
+
+        return KillFeedEvent(
+            raw=raw_data,
+            payload=payload,
+            received_at=datetime.datetime.now(timezone.utc)
+        )
+
+    async def _dispatch(self, event: KillFeedEvent):
+        try:
+            self._event_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            try:
+                _ = self._event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            self._event_queue.put_nowait(event)
+
+        for callback in list(self._callbacks):
+            try:
+                result = callback(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.exception(f"Kill feed callback error: {e}")
+
+
+kill_feed_listener: Optional[KillFeedListener] = None
+
+
+def ensure_kill_feed_listener():
+    """Start the kill feed listener if the feature is enabled."""
+    global kill_feed_listener
+    if not ENABLE_KILL_FEED:
+        return
+
+    if not kill_feed_listener:
+        kill_feed_listener = KillFeedListener(CRCON_WS_URL, CRCON_WS_TOKEN or "")
+
+    if not kill_feed_listener.is_running:
+        logger.info("Starting CRCON kill feed listener")
+        kill_feed_listener.start()
+
 
 class ClockState:
     """Enhanced clock state with live updating team times"""
@@ -1713,6 +1892,9 @@ async def on_ready():
     except Exception as e:
         logger.warning(f"⚠️ CRCON connection test failed: {e}")
     
+    if ENABLE_KILL_FEED:
+        ensure_kill_feed_listener()
+
     # Sync commands
     await bot.wait_until_ready()
     try:
@@ -1748,6 +1930,22 @@ if __name__ == "__main__":
     if not crcon_url.startswith(('http://', 'https://')):
         print("⚠️ WARNING: CRCON_URL should start with http:// or https://")
 
+    # Validate kill feed prerequisites if enabled
+    kill_feed_enabled = ENABLE_KILL_FEED
+    ws_url = CRCON_WS_URL
+    ws_token = CRCON_WS_TOKEN
+    if kill_feed_enabled:
+        missing = []
+        if not ws_url:
+            missing.append("CRCON_WS_URL")
+        if not ws_token or ws_token == "your_crcon_ws_token_here":
+            missing.append("CRCON_WS_TOKEN")
+
+        if missing:
+            print("❌ ENABLE_KILL_FEED=true but the following settings are missing:", ", ".join(missing))
+            print("   Update your .env file or disable ENABLE_KILL_FEED")
+            exit(1)
+
     # Show configuration (without sensitive data)
     print(f"🔗 CRCON: {crcon_url}")
     print(f"🔑 API Key: {'*' * 8}... (configured)")
@@ -1755,6 +1953,11 @@ if __name__ == "__main__":
     print(f"🤖 Bot Name: {os.getenv('BOT_NAME', 'HLLTankBot')}")
     print(f"⏱️ Update Interval: {get_update_interval()}s")
     print(f"🔄 Auto-Switch: {os.getenv('CRCON_AUTO_SWITCH', 'true')}")
+    if kill_feed_enabled:
+        print("💥 Kill Feed: Enabled")
+        print(f"   WS URL: {ws_url}")
+    else:
+        print("💥 Kill Feed: Disabled")
     
     log_channel = os.getenv('LOG_CHANNEL_ID', '0')
     if log_channel != '0':

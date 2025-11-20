@@ -41,6 +41,9 @@
 | `BOT_NAME` | `HLLTankBot` | Name shown in game messages |
 | `BOT_AUTHOR` | `StoneyRebel` | Author shown in embed footer |
 | `LOG_CHANNEL_ID` | `0` | Discord channel for match logs (0 = disabled) |
+| `ENABLE_KILL_FEED` | `false` | Enable experimental tank-kill tracking |
+| `CRCON_WS_URL` | `ws://localhost:8010/ws/logs` | CRCON WebSocket endpoint (required when kill feed is enabled) |
+| `CRCON_WS_TOKEN` | – | Bearer token for the CRCON WebSocket log stream |
 
 ## Discord Setup
 
