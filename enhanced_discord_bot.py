@@ -433,6 +433,10 @@ class KillFeedListener:
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    @property
+    def is_connected(self) -> bool:
+        return self._connected.is_set()
+
     def start(self):
         if self.is_running:
             return
@@ -540,6 +544,10 @@ class KillFeedListener:
 
 kill_feed_listener: Optional[KillFeedListener] = None
 kill_feed_consumer_task: Optional[asyncio.Task] = None
+active_kill_feed_channel_id: Optional[int] = None
+last_kill_feed_event: Optional[KillFeedEvent] = None
+last_tank_kill_detection: Optional[TankKillDetection] = None
+last_tank_kill_event: Optional[KillFeedEvent] = None
 
 
 def ensure_kill_feed_listener():
@@ -568,31 +576,114 @@ async def _kill_feed_detection_loop():
     while True:
         try:
             event: KillFeedEvent = await queue.get()
+            global last_kill_feed_event
+            last_kill_feed_event = event
             detection = detect_tank_kill(event.payload)
             if not detection:
                 continue
-            await _broadcast_tank_kill(detection, event)
+            team_key = resolve_detection_team(detection)
+            if not team_key:
+                continue
+            global last_tank_kill_detection, last_tank_kill_event
+            last_tank_kill_detection = detection
+            last_tank_kill_event = event
+            await _broadcast_tank_kill(team_key, detection, event)
         except asyncio.CancelledError:
             break
         except Exception as exc:
             logger.exception(f"Tank kill detection loop error: {exc}")
 
 
-async def _broadcast_tank_kill(detection: TankKillDetection, event: KillFeedEvent):
-    if not clocks:
+async def _broadcast_tank_kill(team_key: str, detection: TankKillDetection, event: KillFeedEvent):
+    targets = _get_target_clocks()
+    if not targets:
         return
 
-    for clock in list(clocks.values()):
+    for clock in targets:
         try:
-            await clock.add_tank_kill(detection, event)
+            await clock.record_tank_kill(team_key, detection, event)
         except Exception as exc:
-            logger.exception(f"Failed to record tank kill for clock: {exc}")
+            logger.exception(f"Failed to record tank kill for clock {clock.channel_id}: {exc}")
+
+
+def resolve_detection_team(detection: TankKillDetection) -> Optional[str]:
+    killer_team = normalize_team_name(detection.killer_team)
+    if killer_team in ('allied', 'axis'):
+        return killer_team
+
+    victim_team = normalize_team_name(detection.victim_team)
+    if victim_team == 'allied':
+        return 'axis'
+    if victim_team == 'axis':
+        return 'allied'
+    return None
+
+
+def set_active_kill_feed_channel(channel_id: Optional[int]):
+    global active_kill_feed_channel_id
+    if channel_id is not None:
+        active_kill_feed_channel_id = channel_id
+
+
+def release_kill_feed_channel(channel_id: Optional[int]):
+    global active_kill_feed_channel_id
+    if channel_id is None:
+        return
+    if active_kill_feed_channel_id == channel_id:
+        active_kill_feed_channel_id = _find_next_active_channel(exclude=channel_id)
+
+
+def _find_next_active_channel(exclude: Optional[int] = None) -> Optional[int]:
+    for cid, clock in clocks.items():
+        if cid == exclude:
+            continue
+        if clock.started:
+            return cid
+    return None
+
+
+def _get_target_clocks() -> List['ClockState']:
+    clock: Optional['ClockState'] = None
+    if active_kill_feed_channel_id is not None:
+        clock = clocks.get(active_kill_feed_channel_id)
+        if clock and not clock.started:
+            clock = None
+    if clock:
+        return [clock]
+    return [c for c in clocks.values() if c.started]
+
+
+def _format_relative_time(moment: datetime.datetime) -> str:
+    delta = datetime.datetime.now(timezone.utc) - moment
+    seconds = max(0, int(delta.total_seconds()))
+    if seconds < 1:
+        return "just now"
+    units = (
+        ('d', 86400),
+        ('h', 3600),
+        ('m', 60),
+        ('s', 1),
+    )
+    parts: List[str] = []
+    for suffix, size in units:
+        if seconds >= size and len(parts) < 2:
+            value, seconds = divmod(seconds, size)
+            parts.append(f"{value}{suffix}")
+    return " ".join(parts)
+
+
+def _shorten_text(text: str, limit: int = 200) -> str:
+    stripped = " ".join(text.split())
+    if len(stripped) <= limit:
+        return stripped
+    return f"{stripped[:limit - 1]}…"
 
 
 class ClockState:
     """Enhanced clock state with live updating team times"""
 
-    def __init__(self):
+    def __init__(self, channel_id: Optional[int] = None):
+        self.channel_id = channel_id
         self.time_a = 0
         self.time_b = 0
         self.active = None
@@ -635,8 +726,7 @@ class ClockState:
         }
         # Player scores by team
         self.player_scores = {'allied': {}, 'axis': {}}
-        self.tank_kill_counts = {'allied': 0, 'axis': 0}
-        self.tank_kill_events: List[Dict[str, Any]] = []
+        self.reset_tank_kills()
 
     def get_time_remaining(self):
         """Get time remaining in match"""
@@ -820,7 +910,11 @@ class ClockState:
             team_a_name = self.team_names['allied']
             team_b_name = self.team_names['axis']
 
-            msg = f"🔄 {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
+            tank_line = self.format_tank_scoreline()
+            msg = (
+                f"🔄 {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | "
+                f"{team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT\n{tank_line}"
+            )
             await self.crcon_client.send_message(msg)
         
         # IMPORTANT: Update the Discord embed immediately
@@ -1075,11 +1169,41 @@ class ClockState:
             'total_dmt': total_dmt
         }
 
-    async def add_tank_kill(self, detection: TankKillDetection, event: KillFeedEvent):
-        if not self.started:
+    def reset_tank_kills(self):
+        self.tank_kill_counts = {'allied': 0, 'axis': 0}
+        self.tank_kill_events: List[Dict[str, Any]] = []
+
+    def get_tank_kill_count(self, team_key: str) -> int:
+        return self.tank_kill_counts.get(team_key, 0)
+
+    def describe_last_tank_kill(self) -> Optional[str]:
+        if not self.tank_kill_events:
+            return None
+        latest = self.tank_kill_events[-1]
+        killer = latest.get('killer', 'Unknown')
+        victim = latest.get('victim', 'Unknown')
+        detail = latest.get('keyword_match') or latest.get('vehicle') or 'Tank'
+        summary = f"{killer} → {victim} ({detail})"
+        timestamp = latest.get('timestamp')
+        if timestamp:
+            try:
+                parsed = datetime.datetime.fromisoformat(timestamp)
+                summary = f"{summary} • {_format_relative_time(parsed)} ago"
+            except ValueError:
+                summary = f"{summary} • {timestamp}"
+        return summary
+
+    def format_tank_scoreline(self) -> str:
+        allied_name = self.team_names.get('allied', 'Allies')
+        axis_name = self.team_names.get('axis', 'Axis')
+        allied_count = self.get_tank_kill_count('allied')
+        axis_count = self.get_tank_kill_count('axis')
+        return f"💥 Tanks - {allied_name}: {allied_count} | {axis_name}: {axis_count}"
+
+    async def record_tank_kill(self, team_key: str, detection: TankKillDetection, event: KillFeedEvent):
+        if not self.started or team_key not in self.tank_kill_counts:
             return
 
-        normalized_team = normalize_team_name(detection.killer_team)
         entry = {
             'timestamp': event.received_at.isoformat(),
             'killer': detection.killer_name,
@@ -1089,13 +1213,12 @@ class ClockState:
             'weapon': detection.weapon,
             'vehicle': detection.vehicle,
             'keyword_group': detection.keyword_group,
-            'keyword_match': detection.keyword_match
+            'keyword_match': detection.keyword_match,
+            'credited_team': team_key
         }
 
         async with self._lock:
-            if normalized_team and normalized_team in self.tank_kill_counts:
-                self.tank_kill_counts[normalized_team] += 1
-
+            self.tank_kill_counts[team_key] += 1
             self.tank_kill_events.append(entry)
             if len(self.tank_kill_events) > TANK_EVENT_HISTORY_LIMIT:
                 self.tank_kill_events = self.tank_kill_events[-TANK_EVENT_HISTORY_LIMIT:]
@@ -1120,6 +1243,22 @@ async def safe_edit_message(message, **kwargs):
     except Exception as e:
         logger.error(f"Unexpected error editing message: {e}")
         return False
+
+
+def build_tank_kill_field(clock: 'ClockState', include_last: bool = False) -> str:
+    allied_name = clock.team_names.get('allied', 'Allies')
+    axis_name = clock.team_names.get('axis', 'Axis')
+    lines = [
+        f"🇺🇸 {allied_name}: `{clock.get_tank_kill_count('allied')}`",
+        f"🇩🇪 {axis_name}: `{clock.get_tank_kill_count('axis')}`",
+    ]
+    if include_last:
+        last_summary = clock.describe_last_tank_kill()
+        if last_summary:
+            lines.append(f"Last: {last_summary}")
+        else:
+            lines.append("Last: _No tank kills yet_")
+    return "\n".join(lines)
 
 def build_embed(clock: ClockState):
     """Build Discord embed with DMT Scoring"""
@@ -1180,6 +1319,7 @@ def build_embed(clock: ClockState):
 
     embed.add_field(name=f"🏆 {allied_name} DMT", value=dmt_allied, inline=True)
     embed.add_field(name=f"🏆 {axis_name} DMT", value=dmt_axis, inline=True)
+    embed.add_field(name="💥 Tank Kills", value=build_tank_kill_field(clock, include_last=True), inline=False)
 
     # Show leader
     if allied_scores['total_dmt'] > axis_scores['total_dmt']:
@@ -1220,6 +1360,8 @@ class StartControls(discord.ui.View):
         clock = clocks[self.channel_id]
         clock.match_start_time = datetime.datetime.now(timezone.utc)
         clock.started = True
+        clock.reset_tank_kills()
+        set_active_kill_feed_channel(self.channel_id)
 
         # Start the updater first
         if not match_updater.is_running():
@@ -1356,10 +1498,11 @@ class TimerControls(discord.ui.View):
             return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
 
         old_clock = clocks[self.channel_id]
+        release_kill_feed_channel(self.channel_id)
         if old_clock.crcon_client:
             await old_clock.crcon_client.__aexit__(None, None, None)
 
-        clocks[self.channel_id] = ClockState()
+        clocks[self.channel_id] = ClockState(self.channel_id)
         clock = clocks[self.channel_id]
         view = StartControls(self.channel_id)
 
@@ -1401,8 +1544,10 @@ class TimerControls(discord.ui.View):
             else:
                 winner_msg = "DRAW!"
 
+            tank_line = clock.format_tank_scoreline()
             await clock.crcon_client.send_message(
-                f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
+                f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | "
+                f"{team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT\n{tank_line}"
             )
 
         # Create final embed with DMT scores
@@ -1429,6 +1574,7 @@ class TimerControls(discord.ui.View):
             value=f"**{axis_scores['total_dmt']:,.1f} DMT**\nCombat: {axis_scores['combat_total']:,.0f}\nCap: {axis_scores['cap_score']:,.1f} ({clock.format_time(clock.time_b)})",
             inline=True
         )
+        embed.add_field(name="💥 Tank Kills", value=build_tank_kill_field(clock, include_last=True), inline=False)
 
         # Determine winner by DMT score
         if allied_scores['total_dmt'] > axis_scores['total_dmt']:
@@ -1448,6 +1594,8 @@ class TimerControls(discord.ui.View):
 
         # Log results
         await log_results(clock, game_info)
+        release_kill_feed_channel(clock.channel_id)
+        clock.reset_tank_kills()
 
     async def _switch_team(self, interaction: discord.Interaction, team: str):
         if not user_is_admin(interaction):
@@ -1494,7 +1642,11 @@ class TimerControls(discord.ui.View):
             team_a_name = clock.team_names['allied']
             team_b_name = clock.team_names['axis']
 
-            msg = f"⚔️ {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
+            tank_line = clock.format_tank_scoreline()
+            msg = (
+                f"⚔️ {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | "
+                f"{team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT\n{tank_line}"
+            )
             await clock.crcon_client.send_message(msg)
 
         await interaction.response.defer()
@@ -1512,6 +1664,7 @@ async def log_results(clock: ClockState, game_info: dict):
     embed = discord.Embed(title="🏁 HLL Tank Overwatch Match Complete", color=0x800020)
     embed.add_field(name="🇺🇸 Allies Control Time", value=f"`{clock.format_time(clock.time_a)}`", inline=True)
     embed.add_field(name="🇩🇪 Axis Control Time", value=f"`{clock.format_time(clock.time_b)}`", inline=True)
+    embed.add_field(name="💥 Tank Kills", value=build_tank_kill_field(clock), inline=True)
     
     # Winner by time control
     if clock.time_a > clock.time_b:
@@ -1608,8 +1761,10 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
             else:
                 winner_msg = "DRAW!"
 
+            tank_line = clock.format_tank_scoreline()
             await clock.crcon_client.send_message(
-                f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | {team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT"
+                f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | "
+                f"{team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT\n{tank_line}"
             )
 
         # Create final embed with DMT scores
@@ -1636,6 +1791,7 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
             value=f"**{axis_scores['total_dmt']:,.1f} DMT**\nCombat: {axis_scores['combat_total']:,.0f}\nCap: {axis_scores['cap_score']:,.1f} ({clock.format_time(clock.time_b)})",
             inline=True
         )
+        embed.add_field(name="💥 Tank Kills", value=build_tank_kill_field(clock, include_last=True), inline=False)
 
         # Determine winner by DMT score
         if allied_scores['total_dmt'] > axis_scores['total_dmt']:
@@ -1659,7 +1815,10 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
 
         # Log results to log channel
         await log_results(clock, game_info)
-        
+
+        release_kill_feed_channel(clock.channel_id)
+        clock.reset_tank_kills()
+
         logger.info("Match automatically stopped due to game time expiring")
 
     except Exception as e:
@@ -1669,7 +1828,7 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
 @bot.tree.command(name="reverse_clock", description="Start the HLL Tank Overwatch time control clock")
 async def reverse_clock(interaction: discord.Interaction):
     channel_id = interaction.channel_id
-    clocks[channel_id] = ClockState()
+    clocks[channel_id] = ClockState(channel_id)
 
     embed = build_embed(clocks[channel_id])
     view = StartControls(channel_id)
@@ -1732,6 +1891,92 @@ async def crcon_status(interaction: discord.Interaction):
     embed.add_field(name="API Key", value="✅ Configured" if os.getenv('CRCON_API_KEY') else '❌ Not set', inline=True)
     
     await interaction.followup.send(embed=embed)
+
+
+    @bot.tree.command(name="killfeed_status", description="Show CRCON kill feed listener health")
+    async def killfeed_status(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        embed = discord.Embed(title="💥 Kill Feed Status", color=0x3498db)
+        feature_state = "🟢 ENABLE_KILL_FEED=true" if ENABLE_KILL_FEED else "🔴 ENABLE_KILL_FEED=false"
+        embed.add_field(name="Feature", value=feature_state, inline=False)
+
+        if not ENABLE_KILL_FEED:
+            embed.add_field(
+                name="Next Steps",
+                value="Set ENABLE_KILL_FEED=true in your environment to start tracking tank kills.",
+                inline=False
+            )
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+
+        listener = kill_feed_listener
+        if not listener:
+            embed.add_field(
+                name="Listener",
+                value="⚪ Not started (run /reverse_clock and start a match to attach)",
+                inline=False
+            )
+        else:
+            running = "🟢 Running" if listener.is_running else "🔴 Stopped"
+            connected = "🟢 Connected" if listener.is_connected else "🟡 Connecting"
+            queue_size = listener.get_queue().qsize()
+            embed.add_field(
+                name="Listener",
+                value=f"{running}\n{connected}\nQueue: {queue_size}/1000",
+                inline=False
+            )
+
+        channel_value = "None"
+        if active_kill_feed_channel_id is not None:
+            channel_obj = bot.get_channel(active_kill_feed_channel_id)
+            if hasattr(channel_obj, 'name'):
+                prefix = f"#{channel_obj.name}"
+                if getattr(channel_obj, 'guild', None):
+                    prefix = f"{channel_obj.guild.name} {prefix}"
+                channel_value = f"{prefix} ({active_kill_feed_channel_id})"
+            else:
+                channel_value = str(active_kill_feed_channel_id)
+        embed.add_field(name="Active Match Channel", value=channel_value, inline=False)
+
+        config_lines = [
+            f"WS URL: {CRCON_WS_URL or 'Not set'}",
+            f"WS Token: {'Configured' if CRCON_WS_TOKEN else 'Missing'}",
+        ]
+        embed.add_field(name="Configuration", value="\n".join(config_lines), inline=False)
+
+        if last_kill_feed_event:
+            raw_preview = last_kill_feed_event.raw if isinstance(last_kill_feed_event.raw, str) else ''
+            if not raw_preview:
+                try:
+                    raw_preview = json.dumps(last_kill_feed_event.payload) if last_kill_feed_event.payload is not None else "<no payload>"
+                except TypeError:
+                    raw_preview = str(last_kill_feed_event.payload)
+            preview = _shorten_text(raw_preview)
+            embed.add_field(
+                name="Last Event",
+                value=f"{_format_relative_time(last_kill_feed_event.received_at)} ago\n{preview}",
+                inline=False
+            )
+        else:
+            embed.add_field(name="Last Event", value="No kill feed events received yet.", inline=False)
+
+        if last_tank_kill_detection:
+            detection = last_tank_kill_detection
+            detection_time = last_tank_kill_event.received_at if last_tank_kill_event else datetime.datetime.now(timezone.utc)
+            detail = detection.keyword_match or detection.vehicle or detection.weapon
+            detection_summary = (
+                f"{detection.killer_name} ({detection.killer_team}) → {detection.victim_name} ({detection.victim_team})"
+                f" with {detail}"
+            )
+            embed.add_field(
+                name="Last Tank Kill",
+                value=f"{_format_relative_time(detection_time)} ago\n{detection_summary}",
+                inline=False
+            )
+        else:
+            embed.add_field(name="Last Tank Kill", value="No tank kills detected yet.", inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="server_info", description="Get current HLL server information")
 async def server_info(interaction: discord.Interaction):
