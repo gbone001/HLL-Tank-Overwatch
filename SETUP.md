@@ -44,6 +44,7 @@
 | `ENABLE_KILL_FEED` | `false` | Enable experimental tank-kill tracking |
 | `CRCON_WS_URL` | `ws://localhost:8010/ws/logs` | CRCON WebSocket endpoint (required when kill feed is enabled) |
 | `CRCON_WS_TOKEN` | – | Bearer token for the CRCON WebSocket log stream |
+| `TANK_WEAPON_KEYWORDS` | – | JSON string or file path listing weapon keywords that count as tank kills |
 
 ## Discord Setup
 

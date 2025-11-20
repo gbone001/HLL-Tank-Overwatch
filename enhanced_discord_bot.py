@@ -15,7 +15,7 @@ import aiohttp
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -47,6 +47,63 @@ MAX_UPDATE_INTERVAL = 300  # Maximum seconds between updates
 ENABLE_KILL_FEED = os.getenv('ENABLE_KILL_FEED', 'false').lower() == 'true'
 CRCON_WS_URL = os.getenv('CRCON_WS_URL', '').strip()
 CRCON_WS_TOKEN = os.getenv('CRCON_WS_TOKEN')
+TANK_EVENT_HISTORY_LIMIT = 25
+DEFAULT_TANK_WEAPON_KEYWORDS: Dict[str, List[str]] = {
+    "cannon_shells": [
+        "75mm", "76mm", "88mm", "90mm", "122mm",
+        "kwk", "pak", "he shell", "ap shell", "heat shell"
+    ],
+    "tank_names": [
+        "sherman", "panther", "tiger", "t-34", "is-2", "churchill"
+    ],
+    "launchers": [
+        "bazooka", "panzerschreck", "panzerfaust"
+    ],
+    "anti_tank": [
+        "at gun", "anti tank", "flak 36"
+    ],
+    "explosives": [
+        "satchel", "mine"
+    ]
+}
+
+
+def _load_tank_weapon_keywords() -> Tuple[Dict[str, List[str]], str]:
+    raw_value = os.getenv('TANK_WEAPON_KEYWORDS', '').strip()
+    if raw_value:
+        parsed = _parse_keyword_mapping(raw_value)
+        if parsed:
+            return parsed, ('file' if Path(raw_value).exists() else 'env')
+        logger.warning("Invalid TANK_WEAPON_KEYWORDS value. Falling back to defaults.")
+    return DEFAULT_TANK_WEAPON_KEYWORDS, 'default'
+
+
+def _parse_keyword_mapping(value: str) -> Optional[Dict[str, List[str]]]:
+    data = None
+    potential_path = Path(value)
+    if potential_path.exists():
+        try:
+            data = json.loads(potential_path.read_text(encoding='utf-8'))
+        except Exception as exc:
+            logger.warning(f"Failed to read tank keyword file {potential_path}: {exc}")
+            return None
+    else:
+        try:
+            data = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+
+    if not isinstance(data, dict):
+        return None
+
+    normalized: Dict[str, List[str]] = {}
+    for key, values in data.items():
+        if isinstance(values, (list, tuple)):
+            normalized[str(key)] = [str(item).strip() for item in values if str(item).strip()]
+    return normalized
+
+
+TANK_WEAPON_KEYWORDS, TANK_KEYWORD_SOURCE = _load_tank_weapon_keywords()
 
 intents = discord.Intents.default()
 intents.message_content = False
@@ -247,6 +304,119 @@ class KillFeedEvent:
 KillFeedCallback = Callable[[KillFeedEvent], Optional[Awaitable[None]]]
 
 
+@dataclass
+class TankKillDetection:
+    killer_name: str
+    killer_team: str
+    victim_name: str
+    victim_team: str
+    weapon: str
+    vehicle: str
+    keyword_group: Optional[str]
+    keyword_match: Optional[str]
+    raw_payload: Any
+
+
+def normalize_team_name(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    lowered = value.lower()
+    if any(token in lowered for token in ["alli", "usa", "american", "soviet", "uk", "commonwealth"]):
+        return 'allied'
+    if any(token in lowered for token in ["axis", "german", "wehr", "panzer", "ost", "ss"]):
+        return 'axis'
+    return None
+
+
+def _flatten_kill_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        if 'data' in payload and isinstance(payload['data'], dict):
+            merged = payload.copy()
+            merged.update(payload['data'])
+            return merged
+        return payload
+    if isinstance(payload, str):
+        try:
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                return _flatten_kill_payload(parsed)
+        except json.JSONDecodeError:
+            return {'line_without_timestamp': payload, 'raw': payload}
+    return None
+
+
+def _extract_value(source: Dict[str, Any], keys: List[str]) -> str:
+    for key in keys:
+        value = source.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _match_keywords(texts: List[str], keywords: Dict[str, List[str]]) -> Tuple[Optional[str], Optional[str]]:
+    for text in texts:
+        lowered = text.lower()
+        for group, group_keywords in keywords.items():
+            for keyword in group_keywords:
+                if not keyword:
+                    continue
+                if keyword.lower() in lowered:
+                    return group, keyword
+    return None, None
+
+
+def _looks_like_tank_vehicle(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in ["tank", "armor", "armour", "vehicle", "panzer", "sherman"])
+
+
+def detect_tank_kill(payload: Any, keyword_mapping: Optional[Dict[str, List[str]]] = None) -> Optional[TankKillDetection]:
+    keywords = keyword_mapping or TANK_WEAPON_KEYWORDS
+    data = _flatten_kill_payload(payload)
+    if not isinstance(data, dict):
+        return None
+
+    weapon_text = _extract_value(data, ['weapon', 'weapon_name', 'weapon_id', 'message', 'line_without_timestamp'])
+    vehicle_text = _extract_value(data, ['target_vehicle', 'victim_vehicle', 'vehicle', 'destroyed_vehicle'])
+    vehicle_class = _extract_value(data, ['target_vehicle_class', 'victim_vehicle_class', 'vehicle_class'])
+    subtype = _extract_value(data, ['sub_type', 'category', 'type'])
+
+    keyword_group, keyword_match = _match_keywords([weapon_text, vehicle_text], keywords)
+    if not keyword_group and vehicle_class and _looks_like_tank_vehicle(vehicle_class):
+        keyword_group, keyword_match = 'vehicle_class', vehicle_class
+    if not keyword_group and subtype and _looks_like_tank_vehicle(subtype):
+        keyword_group, keyword_match = 'sub_type', subtype
+    if not keyword_group and vehicle_text and _looks_like_tank_vehicle(vehicle_text):
+        keyword_group, keyword_match = 'vehicle', vehicle_text
+    if not keyword_group:
+        return None
+
+    killer_name = _extract_value(data, ['killer_name', 'attacker_name', 'player_name_1', 'source_player', 'player', 'instigator'])
+    killer_team = _extract_value(data, ['killer_team', 'attacker_team', 'player_team_1', 'team'])
+    victim_name = _extract_value(data, ['victim_name', 'target_name', 'player_name_2', 'killed_player'])
+    victim_team = _extract_value(data, ['victim_team', 'target_team', 'player_team_2'])
+    vehicle_name = vehicle_text or vehicle_class or subtype
+
+    return TankKillDetection(
+        killer_name=killer_name or 'Unknown',
+        killer_team=killer_team or 'Unknown',
+        victim_name=victim_name or 'Unknown',
+        victim_team=victim_team or 'Unknown',
+        weapon=weapon_text or 'Unknown',
+        vehicle=vehicle_name or 'Unknown',
+        keyword_group=keyword_group,
+        keyword_match=keyword_match,
+        raw_payload=payload
+    )
+
+
 class KillFeedListener:
     """Consumes the CRCON WebSocket kill feed and fans out events."""
 
@@ -369,11 +539,12 @@ class KillFeedListener:
 
 
 kill_feed_listener: Optional[KillFeedListener] = None
+kill_feed_consumer_task: Optional[asyncio.Task] = None
 
 
 def ensure_kill_feed_listener():
     """Start the kill feed listener if the feature is enabled."""
-    global kill_feed_listener
+    global kill_feed_listener, kill_feed_consumer_task
     if not ENABLE_KILL_FEED:
         return
 
@@ -383,6 +554,39 @@ def ensure_kill_feed_listener():
     if not kill_feed_listener.is_running:
         logger.info("Starting CRCON kill feed listener")
         kill_feed_listener.start()
+
+    if not kill_feed_consumer_task or kill_feed_consumer_task.done():
+        logger.info("Starting tank kill detection loop")
+        kill_feed_consumer_task = asyncio.create_task(_kill_feed_detection_loop(), name="crcon-kill-detector")
+
+
+async def _kill_feed_detection_loop():
+    if not kill_feed_listener:
+        return
+
+    queue = kill_feed_listener.get_queue()
+    while True:
+        try:
+            event: KillFeedEvent = await queue.get()
+            detection = detect_tank_kill(event.payload)
+            if not detection:
+                continue
+            await _broadcast_tank_kill(detection, event)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.exception(f"Tank kill detection loop error: {exc}")
+
+
+async def _broadcast_tank_kill(detection: TankKillDetection, event: KillFeedEvent):
+    if not clocks:
+        return
+
+    for clock in list(clocks.values()):
+        try:
+            await clock.add_tank_kill(detection, event)
+        except Exception as exc:
+            logger.exception(f"Failed to record tank kill for clock: {exc}")
 
 
 class ClockState:
@@ -431,6 +635,8 @@ class ClockState:
         }
         # Player scores by team
         self.player_scores = {'allied': {}, 'axis': {}}
+        self.tank_kill_counts = {'allied': 0, 'axis': 0}
+        self.tank_kill_events: List[Dict[str, Any]] = []
 
     def get_time_remaining(self):
         """Get time remaining in match"""
@@ -868,6 +1074,31 @@ class ClockState:
             'cap_score': cap_score,
             'total_dmt': total_dmt
         }
+
+    async def add_tank_kill(self, detection: TankKillDetection, event: KillFeedEvent):
+        if not self.started:
+            return
+
+        normalized_team = normalize_team_name(detection.killer_team)
+        entry = {
+            'timestamp': event.received_at.isoformat(),
+            'killer': detection.killer_name,
+            'killer_team': detection.killer_team,
+            'victim': detection.victim_name,
+            'victim_team': detection.victim_team,
+            'weapon': detection.weapon,
+            'vehicle': detection.vehicle,
+            'keyword_group': detection.keyword_group,
+            'keyword_match': detection.keyword_match
+        }
+
+        async with self._lock:
+            if normalized_team and normalized_team in self.tank_kill_counts:
+                self.tank_kill_counts[normalized_team] += 1
+
+            self.tank_kill_events.append(entry)
+            if len(self.tank_kill_events) > TANK_EVENT_HISTORY_LIMIT:
+                self.tank_kill_events = self.tank_kill_events[-TANK_EVENT_HISTORY_LIMIT:]
 
 def user_is_admin(interaction: discord.Interaction):
     admin_role = os.getenv('ADMIN_ROLE_NAME', 'admin').lower()
@@ -1956,6 +2187,8 @@ if __name__ == "__main__":
     if kill_feed_enabled:
         print("💥 Kill Feed: Enabled")
         print(f"   WS URL: {ws_url}")
+        keyword_total = sum(len(values) for values in TANK_WEAPON_KEYWORDS.values())
+        print(f"   Tank Keywords: {keyword_total} entries ({TANK_KEYWORD_SOURCE})")
     else:
         print("💥 Kill Feed: Disabled")
     
