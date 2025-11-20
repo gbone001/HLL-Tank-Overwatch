@@ -132,7 +132,7 @@ The bot creates interactive Discord embeds showing:
 | `LOG_CHANNEL_ID` | `0` | Discord channel for match logs (0 = disabled) |
 | `ENABLE_KILL_FEED` | `false` | Toggle experimental tank-kill tracking via CRCON WebSocket |
 | `CRCON_WS_URL` | `ws://localhost:8010/ws/logs` | CRCON WebSocket endpoint (required when kill feed is enabled) |
-| `CRCON_WS_TOKEN` | – | Bearer token for the CRCON WebSocket log stream |
+| `CRCON_WS_TOKEN` | `CRCON_API_KEY` | Bearer token for the CRCON WebSocket log stream (leave blank to reuse the API key) |
 | `TANK_WEAPON_KEYWORDS` | – | JSON string or file path listing weapon keywords that count as tank kills |
 
 ## 🎮 Discord Setup
@@ -226,7 +226,7 @@ Need to validate the tank kill overlay without a production server? Use the mock
    ```env
    ENABLE_KILL_FEED=true
    CRCON_WS_URL=ws://localhost:8765
-   CRCON_WS_TOKEN=local-dev
+   CRCON_WS_TOKEN=local-dev  # leave blank to reuse CRCON_API_KEY
    ```
 4. Run `python enhanced_discord_bot.py`, fire `/reverse_clock`, and start a match.
 5. Use `/killfeed_status` to confirm the listener is connected, then trigger sample kills from the mock terminal—tank counts should update immediately in the embed, CRCON broadcasts, and log output.

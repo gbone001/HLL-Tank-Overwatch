@@ -43,7 +43,7 @@
 | `LOG_CHANNEL_ID` | `0` | Discord channel for match logs (0 = disabled) |
 | `ENABLE_KILL_FEED` | `false` | Enable experimental tank-kill tracking |
 | `CRCON_WS_URL` | `ws://localhost:8010/ws/logs` | CRCON WebSocket endpoint (required when kill feed is enabled) |
-| `CRCON_WS_TOKEN` | – | Bearer token for the CRCON WebSocket log stream |
+| `CRCON_WS_TOKEN` | `CRCON_API_KEY` | Bearer token for the CRCON WebSocket log stream (leave blank to reuse the API key) |
 | `TANK_WEAPON_KEYWORDS` | – | JSON string or file path listing weapon keywords that count as tank kills |
 
 ## Discord Setup
@@ -109,7 +109,7 @@ For manual testing without a live CRCON feed:
    ```bash
    node tools/mock_kill_feed_server.js --port 8765 --token local-dev
    ```
-3. Set `.env` to point at the mock (`ENABLE_KILL_FEED=true`, `CRCON_WS_URL=ws://localhost:8765`, `CRCON_WS_TOKEN=local-dev`).
+3. Set `.env` to point at the mock (`ENABLE_KILL_FEED=true`, `CRCON_WS_URL=ws://localhost:8765`, `CRCON_WS_TOKEN=local-dev` or leave blank to reuse `CRCON_API_KEY`).
 4. Run the bot, start a match, then tap **ENTER** in the mock terminal to stream canned tank kills (or pipe custom JSON) and watch the Discord embed update.
 
 ## Troubleshooting

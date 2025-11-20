@@ -47,7 +47,8 @@ MIN_UPDATE_INTERVAL = 5  # Minimum seconds between updates
 MAX_UPDATE_INTERVAL = 300  # Maximum seconds between updates
 ENABLE_KILL_FEED = os.getenv('ENABLE_KILL_FEED', 'false').lower() == 'true'
 CRCON_WS_URL = os.getenv('CRCON_WS_URL', '').strip()
-CRCON_WS_TOKEN = os.getenv('CRCON_WS_TOKEN')
+RAW_CRCON_WS_TOKEN = os.getenv('CRCON_WS_TOKEN', '').strip()
+CRCON_WS_TOKEN = RAW_CRCON_WS_TOKEN or (os.getenv('CRCON_API_KEY') or '').strip()
 TANK_EVENT_HISTORY_LIMIT = 25
 DEFAULT_TANK_WEAPON_KEYWORDS: Dict[str, List[str]] = {
     "cannon_shells": [
@@ -1956,9 +1957,14 @@ async def crcon_status(interaction: discord.Interaction):
                 channel_value = str(active_kill_feed_channel_id)
         embed.add_field(name="Active Match Channel", value=channel_value, inline=False)
 
+        if CRCON_WS_TOKEN:
+            token_status = "Custom value" if RAW_CRCON_WS_TOKEN else "Using CRCON_API_KEY"
+        else:
+            token_status = "Missing"
+
         config_lines = [
             f"WS URL: {CRCON_WS_URL or 'Not set'}",
-            f"WS Token: {'Configured' if CRCON_WS_TOKEN else 'Missing'}",
+            f"WS Token: {token_status}",
         ]
         embed.add_field(name="Configuration", value="\n".join(config_lines), inline=False)
 
@@ -2432,8 +2438,8 @@ if __name__ == "__main__":
         missing = []
         if not ws_url:
             missing.append("CRCON_WS_URL")
-        if not ws_token or ws_token == "your_crcon_ws_token_here":
-            missing.append("CRCON_WS_TOKEN")
+        if not ws_token:
+            missing.append("CRCON_WS_TOKEN (defaults to CRCON_API_KEY)")
 
         if missing:
             print("❌ ENABLE_KILL_FEED=true but the following settings are missing:", ", ".join(missing))
@@ -2450,6 +2456,8 @@ if __name__ == "__main__":
     if kill_feed_enabled:
         print("💥 Kill Feed: Enabled")
         print(f"   WS URL: {ws_url}")
+        token_source = "custom token" if RAW_CRCON_WS_TOKEN else "CRCON_API_KEY"
+        print(f"   WS Token Source: {token_source}")
         keyword_total = sum(len(values) for values in TANK_WEAPON_KEYWORDS.values())
         print(f"   Tank Keywords: {keyword_total} entries ({TANK_KEYWORD_SOURCE})")
     else:
