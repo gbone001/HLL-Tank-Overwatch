@@ -6,6 +6,18 @@ A Discord bot for Hell Let Loose communities that tracks time control of the cen
 ![Python](https://img.shields.io/badge/Python-3.8+-3776ab?style=flat-square&logo=python)
 ![Railway](https://img.shields.io/badge/Deploy-Railway-0B0D0E?style=flat-square&logo=railway)
 
+## 🔗 Quick Links
+- [✨ Features](#-features)
+- [🚀 Deploy to Railway](#-quick-deploy-to-railway)
+- [🛠️ Local Setup](#️-local-development-setup)
+- [⚙️ Environment Variables](#️-environment-variables)
+- [🎮 Discord Setup](#-discord-setup)
+- [📖 Usage](#-usage)
+- [🐛 Troubleshooting](#-troubleshooting)
+- [🤝 Contributing](#-contributing)
+
+> **Before you start:** you need a Discord bot token (`DISCORD_TOKEN`) and a CRCON API key (`CRCON_API_KEY`). Without both values the bot exits immediately (same behavior in Railway and local runs).
+
 ## ✨ Features
 
 - **⏱️ Time Control Tracking** - Tracks how long each team controls the center point
@@ -186,6 +198,8 @@ Make sure to include `http://` or `https://`
 | `/server_info` | Get current server information |
 | `/send_message` | Send message to game (admin only) |
 | `/help_clock` | Show help information |
+| `/test_map` | Debug CRCON map/player payloads |
+| `/test_player_scores` | Inspect detailed player stats for DMT scoring |
 
 ## 🏆 How It Works
 
@@ -219,15 +233,17 @@ Make sure to include `http://` or `https://`
 - Verify `CRCON_URL` is correct and accessible
 - Check `CRCON_API_KEY` is valid
 - Ensure CRCON server is running
+- Use `/crcon_status` or `/test_map` for live diagnostics
 
 **Auto-switch not working:**
 - Set `CRCON_AUTO_SWITCH=true`
 - Verify CRCON connection is stable
 - Check game is on a Warfare map
+- Use `/test_player_scores` to confirm detailed player data is available for DMT scoring
 
 ### Logs
 
-Check Railway logs or local `logs/bot.log` file for detailed error information.
+Check Railway logs or local `logs/bot.log` file for detailed error information. Slash commands like `/crcon_status` and `/test_map` provide additional runtime context without digging through logs.
 
 ## 🤝 Contributing
 
@@ -236,6 +252,8 @@ Check Railway logs or local `logs/bot.log` file for detailed error information.
 3. Commit your changes (`git commit -m 'Add amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for coding guidelines, testing expectations, and PR checklists. When adding new environment variables, remember to: update `.env.template`, document them here and in `SETUP.md`, validate them during startup (`if __name__ == "__main__"`), and mirror requirements in `.github/workflows/test.yml` if CI depends on them.
 
 ## 📄 License
 
