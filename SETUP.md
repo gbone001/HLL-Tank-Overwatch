@@ -97,6 +97,21 @@
    - Use `/server_info` for current server information
    - Run `/killfeed_status` to check kill feed health when tank tracking is enabled
 
+## Local Kill Feed Mock
+
+For manual testing without a live CRCON feed:
+
+1. Install the dev dependency once:
+   ```bash
+   npm install ws
+   ```
+2. Start the helper:
+   ```bash
+   node tools/mock_kill_feed_server.js --port 8765 --token local-dev
+   ```
+3. Set `.env` to point at the mock (`ENABLE_KILL_FEED=true`, `CRCON_WS_URL=ws://localhost:8765`, `CRCON_WS_TOKEN=local-dev`).
+4. Run the bot, start a match, then tap **ENTER** in the mock terminal to stream canned tank kills (or pipe custom JSON) and watch the Discord embed update.
+
 ## Troubleshooting
 
 - **Bot won't start:** Check your `.env` file has valid `DISCORD_TOKEN` and `CRCON_API_KEY`

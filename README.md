@@ -208,6 +208,31 @@ Make sure to include `http://` or `https://`
 | `/test_map` | Debug CRCON map/player payloads |
 | `/test_player_scores` | Inspect detailed player stats for DMT scoring |
 
+## 🧪 Diagnostics & Manual Testing
+
+Need to validate the tank kill overlay without a production server? Use the mock WebSocket helper:
+
+1. Install the lightweight dev dependency (ignored by git):
+   ```bash
+   npm install ws
+   ```
+2. Start the mock feed (defaults shown):
+   ```bash
+   node tools/mock_kill_feed_server.js --port 8765 --token local-dev
+   ```
+   - Press **ENTER** to emit the next canned tank kill
+   - Or paste raw JSON (one line) to broadcast custom payloads
+3. Point the bot at the mock feed in `.env`:
+   ```env
+   ENABLE_KILL_FEED=true
+   CRCON_WS_URL=ws://localhost:8765
+   CRCON_WS_TOKEN=local-dev
+   ```
+4. Run `python enhanced_discord_bot.py`, fire `/reverse_clock`, and start a match.
+5. Use `/killfeed_status` to confirm the listener is connected, then trigger sample kills from the mock terminal—tank counts should update immediately in the embed, CRCON broadcasts, and log output.
+
+Set `AUTO_INTERVAL=3000 node tools/mock_kill_feed_server.js` to continuously stream test kills while iterating on UI.
+
 ## 🏆 How It Works
 
 ### Time Control System

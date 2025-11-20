@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -477,7 +478,8 @@ class KillFeedListener:
             try:
                 headers = {'Authorization': f'Bearer {self.token}'} if self.token else {}
                 async with aiohttp.ClientSession(headers=headers) as session:
-                    logger.info(f"Connecting to CRCON kill feed at {self.url}")
+                    safe_url = _sanitize_ws_url(self.url)
+                    logger.info(f"Connecting to CRCON kill feed at {safe_url}")
                     async with session.ws_connect(self.url, heartbeat=30) as ws:
                         logger.info("Kill feed connected")
                         self._connected.set()
@@ -554,13 +556,15 @@ def ensure_kill_feed_listener():
     """Start the kill feed listener if the feature is enabled."""
     global kill_feed_listener, kill_feed_consumer_task
     if not ENABLE_KILL_FEED:
+        logger.debug("Kill feed listener skipped (ENABLE_KILL_FEED=false)")
         return
 
     if not kill_feed_listener:
+        logger.info("Initializing kill feed listener for %s", _sanitize_ws_url(CRCON_WS_URL))
         kill_feed_listener = KillFeedListener(CRCON_WS_URL, CRCON_WS_TOKEN or "")
 
     if not kill_feed_listener.is_running:
-        logger.info("Starting CRCON kill feed listener")
+        logger.info("Starting CRCON kill feed listener task")
         kill_feed_listener.start()
 
     if not kill_feed_consumer_task or kill_feed_consumer_task.done():
@@ -622,7 +626,9 @@ def resolve_detection_team(detection: TankKillDetection) -> Optional[str]:
 def set_active_kill_feed_channel(channel_id: Optional[int]):
     global active_kill_feed_channel_id
     if channel_id is not None:
+        previous = active_kill_feed_channel_id
         active_kill_feed_channel_id = channel_id
+        logger.info("Kill feed routed to channel %s (was %s)", channel_id, previous)
 
 
 def release_kill_feed_channel(channel_id: Optional[int]):
@@ -630,7 +636,9 @@ def release_kill_feed_channel(channel_id: Optional[int]):
     if channel_id is None:
         return
     if active_kill_feed_channel_id == channel_id:
-        active_kill_feed_channel_id = _find_next_active_channel(exclude=channel_id)
+        next_channel = _find_next_active_channel(exclude=channel_id)
+        active_kill_feed_channel_id = next_channel
+        logger.info("Kill feed channel released from %s -> %s", channel_id, next_channel)
 
 
 def _find_next_active_channel(exclude: Optional[int] = None) -> Optional[int]:
@@ -651,6 +659,16 @@ def _get_target_clocks() -> List['ClockState']:
     if clock:
         return [clock]
     return [c for c in clocks.values() if c.started]
+
+
+def _sanitize_ws_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, '', ''))
+    except Exception:
+        return url
 
 
 def _format_relative_time(moment: datetime.datetime) -> str:
