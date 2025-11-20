@@ -95,6 +95,7 @@
 3. **View stats:**
    - Click "📊 Stats" for live match statistics
    - Use `/server_info` for current server information
+   - Run `/killfeed_status` to check kill feed health when tank tracking is enabled
 
 ## Troubleshooting
 
@@ -102,6 +103,7 @@
 - **No admin permissions:** Make sure you have the role specified in `ADMIN_ROLE_NAME`
 - **CRCON not connecting:** Verify `CRCON_URL` and `CRCON_API_KEY` are correct
 - **Auto-switch not working:** Enable `CRCON_AUTO_SWITCH=true` and ensure CRCON connection is stable
+- **Kill feed idle:** Confirm `ENABLE_KILL_FEED=true`, CRCON WebSocket settings are valid, and inspect `/killfeed_status` for listener/connection details
 
 ## Support
 
