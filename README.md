@@ -133,6 +133,8 @@ The bot creates interactive Discord embeds showing:
 | `ENABLE_KILL_FEED` | `false` | Toggle experimental tank-kill tracking via CRCON WebSocket |
 | `CRCON_WS_URL` | `ws://localhost:8010/ws/logs` | CRCON WebSocket endpoint (required when kill feed is enabled) |
 | `CRCON_WS_TOKEN` | `CRCON_API_KEY` | Bearer token for the CRCON WebSocket log stream (leave blank to reuse the API key) |
+| `CRCON_WS_HEARTBEAT` | `30` | WebSocket ping interval in seconds (set to `0` to disable heartbeat pings) |
+| `CRCON_WS_VERIFY_SSL` | `true` | Verify TLS certificates for the WebSocket (`false` helps with self-signed certs) |
 | `TANK_WEAPON_KEYWORDS` | – | JSON string or file path listing weapon keywords that count as tank kills |
 
 ## 🎮 Discord Setup

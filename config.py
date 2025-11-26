@@ -50,3 +50,13 @@ def crcon_timeout(default: int = 15) -> int:
 
 def tanks_file(default: str = "tanks.json") -> str:
     return os.getenv("TANKS_FILE", default).strip()
+
+
+def crcon_ws_heartbeat(default: int = 30) -> int:
+    """Heartbeat interval (seconds) for the CRCON WebSocket; 0 disables pings."""
+    return _get_int("CRCON_WS_HEARTBEAT", default)
+
+
+def crcon_ws_verify_ssl(default: bool = True) -> bool:
+    """Whether to verify TLS certificates for the CRCON WebSocket."""
+    return _get_bool("CRCON_WS_VERIFY_SSL", default)

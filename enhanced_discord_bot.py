@@ -49,7 +49,9 @@ from config import (
     crcon_api_key,
     crcon_timeout,
     crcon_url,
+    crcon_ws_heartbeat,
     crcon_ws_token,
+    crcon_ws_verify_ssl,
     crcon_ws_url,
     enable_kill_feed,
     tanks_file,
@@ -59,6 +61,8 @@ ENABLE_KILL_FEED = enable_kill_feed()
 CRCON_WS_URL = crcon_ws_url()
 RAW_CRCON_WS_TOKEN = (os.getenv('CRCON_WS_TOKEN') or '').strip()
 CRCON_WS_TOKEN = crcon_ws_token()
+CRCON_WS_HEARTBEAT = crcon_ws_heartbeat()
+CRCON_WS_VERIFY_SSL = crcon_ws_verify_ssl()
 TANK_EVENT_HISTORY_LIMIT = 25
 DEFAULT_TANK_WEAPON_KEYWORDS: Dict[str, List[str]] = {
     "cannon_shells": [
@@ -589,6 +593,8 @@ class KillFeedListener:
         backoff_base: int = 5,
         backoff_max: int = 60,
         auth_fail_limit: int = 3,
+        heartbeat: int = 30,
+        verify_ssl: bool = True,
     ):
         self.url = url
         self.token = token or ""
@@ -602,6 +608,8 @@ class KillFeedListener:
         self._auth_fail_limit = auth_fail_limit
         self._auth_failures = 0
         self.disabled_reason: Optional[str] = None
+        self._heartbeat = max(0, heartbeat)
+        self._verify_ssl = verify_ssl
 
     @property
     def is_running(self) -> bool:
@@ -652,6 +660,8 @@ class KillFeedListener:
         backoff = self._backoff_base
         while not self._stop_event.is_set():
             try:
+                ssl_context = None if self._verify_ssl else False
+                heartbeat = self._heartbeat or None
                 headers = {}
                 if self.token:
                     headers['Authorization'] = f'Bearer {self.token}'
@@ -663,7 +673,8 @@ class KillFeedListener:
                     )
                     async with session.ws_connect(
                         self.url,
-                        heartbeat=30,
+                        heartbeat=heartbeat,
+                        ssl=ssl_context,
                     ) as ws:
                         logger.info("Kill feed connected")
                         # Send subscription filter so CRCON knows which actions we want
@@ -682,14 +693,53 @@ class KillFeedListener:
                                 break
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 event = self._build_event(msg.data)
+                                if isinstance(event.payload, dict) and event.payload.get("error"):
+                                    error_msg = str(event.payload.get("error"))
+                                    self.disabled_reason = f"CRCON stream error: {error_msg}"
+                                    logger.error(
+                                        "Kill feed disabled by server: %s",
+                                        error_msg,
+                                    )
+                                    await ws.close(code=1000)
+                                    self._stop_event.set()
+                                    break
                                 if self._should_accept_event(event):
                                     await self._dispatch(event)
+                            elif msg.type == aiohttp.WSMsgType.CLOSING:
+                                logger.warning(
+                                    "Kill feed websocket closing: code=%s message=%s",
+                                    ws.close_code,
+                                    _format_ws_close_reason(
+                                        getattr(ws, "close_message", None)
+                                        or getattr(ws, "close_reason", None)
+                                    ),
+                                )
+                                break
                             elif msg.type in (
                                 aiohttp.WSMsgType.ERROR,
                                 aiohttp.WSMsgType.CLOSED,
                                 aiohttp.WSMsgType.CLOSE,
                             ):
+                                logger.warning(
+                                    "Kill feed websocket closed (%s): code=%s message=%s",
+                                    msg.type.name,
+                                    ws.close_code,
+                                    _format_ws_close_reason(
+                                        getattr(ws, "close_message", None)
+                                        or getattr(ws, "close_reason", None)
+                                    ),
+                                )
                                 break
+                        if not ws.closed:
+                            await ws.close()
+                        logger.warning(
+                            "Kill feed websocket ended: code=%s message=%s",
+                            ws.close_code,
+                            _format_ws_close_reason(
+                                getattr(ws, "close_message", None)
+                                or getattr(ws, "close_reason", None)
+                            ),
+                        )
                 self._connected.clear()
                 if self._stop_event.is_set():
                     break
@@ -701,6 +751,26 @@ class KillFeedListener:
                 backoff = min(backoff * 2, self._backoff_max)
             except asyncio.CancelledError:
                 break
+            except aiohttp.ClientConnectorCertificateError as e:
+                self._connected.clear()
+                logger.error(
+                    "Kill feed TLS verification failed for %s: %s. "
+                    "Set CRCON_WS_VERIFY_SSL=false only if you trust the server certificate.",
+                    _sanitize_ws_url(self.url),
+                    e,
+                )
+                self.disabled_reason = "TLS verification failed (see logs)"
+                self._stop_event.set()
+                break
+            except aiohttp.WSServerHandshakeError as e:
+                self._connected.clear()
+                logger.warning(
+                    "Kill feed handshake failed (%s): %s",
+                    getattr(e, "status", "unknown status"),
+                    e,
+                )
+                await self._sleep_with_jitter(backoff)
+                backoff = min(backoff * 2, self._backoff_max)
             except aiohttp.ClientResponseError as e:
                 self._connected.clear()
                 if self._stop_event.is_set():
@@ -732,7 +802,11 @@ class KillFeedListener:
                 self._connected.clear()
                 if self._stop_event.is_set():
                     break
-                logger.debug("Kill feed transient error: %s", e)
+                logger.warning(
+                    "Kill feed transient error (%s): %s",
+                    e.__class__.__name__,
+                    e,
+                )
                 await self._sleep_with_jitter(backoff)
                 backoff = min(backoff * 2, self._backoff_max)
 
@@ -802,7 +876,12 @@ def ensure_kill_feed_listener():
 
     if not kill_feed_listener:
         logger.info("Initializing kill feed listener for %s", _sanitize_ws_url(CRCON_WS_URL))
-        kill_feed_listener = KillFeedListener(CRCON_WS_URL, CRCON_WS_TOKEN or "")
+        kill_feed_listener = KillFeedListener(
+            CRCON_WS_URL,
+            CRCON_WS_TOKEN or "",
+            heartbeat=CRCON_WS_HEARTBEAT,
+            verify_ssl=CRCON_WS_VERIFY_SSL,
+        )
 
     if not kill_feed_listener.is_running:
         logger.info("Starting CRCON kill feed listener task")
@@ -900,6 +979,17 @@ def _get_target_clocks() -> List['ClockState']:
     if clock:
         return [clock]
     return [c for c in clocks.values() if c.started]
+
+
+def _format_ws_close_reason(reason: Any) -> str:
+    if reason is None:
+        return ""
+    if isinstance(reason, bytes):
+        try:
+            return reason.decode("utf-8", errors="ignore")
+        except Exception:
+            return repr(reason)
+    return str(reason)
 
 
 def _sanitize_ws_url(url: str) -> str:
@@ -2354,6 +2444,8 @@ async def killfeed_status(interaction: discord.Interaction):
     config_lines = [
         f"WS URL: {CRCON_WS_URL or 'Not set'}",
         f"WS Token: {token_status}",
+        f"Heartbeat: {f'{CRCON_WS_HEARTBEAT}s' if CRCON_WS_HEARTBEAT else 'off'}",
+        f"TLS Verify: {'on' if CRCON_WS_VERIFY_SSL else 'off'}",
     ]
     embed.add_field(name="Configuration", value="\n".join(config_lines), inline=False)
 
