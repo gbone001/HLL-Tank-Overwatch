@@ -46,3 +46,7 @@ def crcon_ws_token() -> str:
 
 def crcon_timeout(default: int = 15) -> int:
     return _get_int("CRCON_TIMEOUT", default)
+
+
+def tanks_file(default: str = "tanks.json") -> str:
+    return os.getenv("TANKS_FILE", default).strip()

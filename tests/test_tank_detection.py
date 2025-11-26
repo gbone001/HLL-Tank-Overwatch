@@ -1,6 +1,8 @@
+import json
 import unittest
+from pathlib import Path
 
-from enhanced_discord_bot import detect_tank_kill
+from enhanced_discord_bot import detect_tank_kill, _derive_keywords_from_tanks_file
 
 
 class TankDetectionTests(unittest.TestCase):
@@ -65,6 +67,43 @@ class TankDetectionTests(unittest.TestCase):
         detection = detect_tank_kill(payload, self.keywords)
         self.assertIsNotNone(detection)
         self.assertEqual(detection.weapon, "88mm cannon")
+
+    def test_vehicle_name_matches_without_weapon(self):
+        payload = {
+            "victim_vehicle": "Panther Ausf. G",
+        }
+        keywords = {
+            "vehicles": ["panther ausf. g"],
+        }
+        detection = detect_tank_kill(payload, keywords)
+        self.assertIsNotNone(detection)
+        self.assertEqual(detection.keyword_group, "vehicles")
+
+    def test_keywords_derived_from_tank_file(self):
+        tmp_file = Path("tmp_tanks.json")
+        sample = [
+            {
+                "vehicle": "Tiger I",
+                "class": "Heavy",
+                "side": "Axis",
+                "country": "Germany",
+                "gun": "88mm KwK 36 L/56"
+            }
+        ]
+        tmp_file.write_text(json.dumps(sample), encoding="utf-8")
+        try:
+            derived = _derive_keywords_from_tanks_file(str(tmp_file))
+            self.assertIn("88mm", derived.get("calibers", []))
+            self.assertIn("tiger i", derived.get("vehicles", []))
+
+            payload = {
+                "weapon": "88mm shell",
+                "victim_vehicle": "Tiger I",
+            }
+            detection = detect_tank_kill(payload, derived)
+            self.assertIsNotNone(detection)
+        finally:
+            tmp_file.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

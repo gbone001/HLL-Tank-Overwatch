@@ -52,6 +52,7 @@ from config import (
     crcon_ws_token,
     crcon_ws_url,
     enable_kill_feed,
+    tanks_file,
 )
 
 ENABLE_KILL_FEED = enable_kill_feed()
@@ -81,12 +82,19 @@ DEFAULT_TANK_WEAPON_KEYWORDS: Dict[str, List[str]] = {
 
 def _load_tank_weapon_keywords() -> Tuple[Dict[str, List[str]], str]:
     raw_value = os.getenv('TANK_WEAPON_KEYWORDS', '').strip()
+    base = DEFAULT_TANK_WEAPON_KEYWORDS.copy()
+    source = 'default'
     if raw_value:
         parsed = _parse_keyword_mapping(raw_value)
         if parsed:
-            return parsed, ('file' if Path(raw_value).exists() else 'env')
-        logger.warning("Invalid TANK_WEAPON_KEYWORDS value. Falling back to defaults.")
-    return DEFAULT_TANK_WEAPON_KEYWORDS, 'default'
+            base = parsed
+            source = 'file' if Path(raw_value).exists() else 'env'
+        else:
+            logger.warning("Invalid TANK_WEAPON_KEYWORDS value. Falling back to defaults.")
+    derived = _derive_keywords_from_tanks_file(tanks_file())
+    merged = _merge_keyword_sets(base, derived)
+    final_source = f"{source}+tanks" if derived else source
+    return merged, final_source
 
 
 def _parse_keyword_mapping(value: str) -> Optional[Dict[str, List[str]]]:
@@ -116,6 +124,63 @@ def _parse_keyword_mapping(value: str) -> Optional[Dict[str, List[str]]]:
         if isinstance(values, (list, tuple)):
             normalized[str(key)] = [str(item).strip() for item in values if str(item).strip()]
     return normalized
+
+
+def _derive_keywords_from_tanks_file(path: str) -> Dict[str, List[str]]:
+    file_path = Path(path)
+    if not file_path.exists():
+        return {}
+    try:
+        data = json.loads(file_path.read_text(encoding='utf-8'))
+    except Exception as exc:
+        logger.warning("Failed to parse tanks file %s: %s", file_path, exc)
+        return {}
+    if not isinstance(data, list):
+        return {}
+
+    calibers: set = set()
+    vehicle_names: set = set()
+    classes: set = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        gun = entry.get("gun") or ""
+        vehicle = entry.get("vehicle") or ""
+        vehicle_class = entry.get("class") or ""
+
+        # Extract calibers like "75mm" or "17-pounder"
+        gun_lower = str(gun).lower()
+        for token in gun_lower.replace("/", " ").replace("(", " ").replace(")", " ").split():
+            if token.endswith("mm"):
+                calibers.add(token)
+            if "pounder" in token:
+                calibers.add(token)
+
+        if vehicle:
+            vehicle_names.add(str(vehicle).lower())
+        if vehicle_class:
+            classes.add(str(vehicle_class).lower())
+
+    return {
+        "calibers": sorted(calibers),
+        "vehicles": sorted(vehicle_names),
+        "classes": sorted(classes),
+    }
+
+
+def _merge_keyword_sets(base: Dict[str, List[str]], extra: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    merged: Dict[str, List[str]] = {k: list(v) for k, v in base.items()}
+    for group, values in extra.items():
+        if not values:
+            continue
+        existing = merged.get(group, [])
+        seen = {v.lower() for v in existing}
+        for val in values:
+            if val.lower() not in seen:
+                existing.append(val)
+                seen.add(val.lower())
+        merged[group] = existing
+    return merged
 
 
 TANK_WEAPON_KEYWORDS, TANK_KEYWORD_SOURCE = _load_tank_weapon_keywords()
@@ -471,7 +536,7 @@ def detect_tank_kill(
     )
 
     keyword_group, keyword_match = _match_keywords(
-        [weapon_text, vehicle_text],
+        [weapon_text, vehicle_text, vehicle_class or "", subtype or ""],
         keywords,
     )
     if not keyword_group and vehicle_class and _looks_like_tank_vehicle(vehicle_class):
