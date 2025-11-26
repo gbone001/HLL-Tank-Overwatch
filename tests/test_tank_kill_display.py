@@ -31,6 +31,11 @@ class TankKillDisplayTests(unittest.TestCase):
         self.assertIn('Able Gunner', field)
         self.assertIn('Tiger Crew', field)
 
+    def test_build_field_with_no_events(self):
+        clock = ClockState()
+        field = build_tank_kill_field(clock, include_last=True)
+        self.assertIn('No tank kills yet', field)
+
 
 if __name__ == '__main__':
     unittest.main()

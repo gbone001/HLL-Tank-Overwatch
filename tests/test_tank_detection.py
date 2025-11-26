@@ -54,6 +54,18 @@ class TankDetectionTests(unittest.TestCase):
         detection = detect_tank_kill(payload, self.keywords)
         self.assertIsNone(detection)
 
+    def test_non_dict_payload_is_ignored(self):
+        self.assertIsNone(detect_tank_kill("raw string", self.keywords))
+        self.assertIsNone(detect_tank_kill(None, self.keywords))
+
+    def test_partial_fields_still_produce_detection(self):
+        payload = {
+            "weapon": "88mm cannon",
+        }
+        detection = detect_tank_kill(payload, self.keywords)
+        self.assertIsNotNone(detection)
+        self.assertEqual(detection.weapon, "88mm cannon")
+
 
 if __name__ == "__main__":
     unittest.main()

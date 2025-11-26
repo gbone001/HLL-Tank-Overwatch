@@ -13,6 +13,7 @@ import datetime
 import json
 import aiohttp
 import logging
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -44,14 +45,19 @@ GAME_END_THRESHOLD = 30  # Stop match when server time is below this
 MESSAGE_TRUNCATE_LENGTH = 1900  # Max length for test messages
 MIN_UPDATE_INTERVAL = 5  # Minimum seconds between updates
 MAX_UPDATE_INTERVAL = 300  # Maximum seconds between updates
-ENABLE_KILL_FEED = (
-    os.getenv('ENABLE_KILL_FEED', 'false').lower() == 'true'
+from config import (
+    crcon_api_key,
+    crcon_timeout,
+    crcon_url,
+    crcon_ws_token,
+    crcon_ws_url,
+    enable_kill_feed,
 )
-CRCON_WS_URL = os.getenv('CRCON_WS_URL', '').strip()
-RAW_CRCON_WS_TOKEN = os.getenv('CRCON_WS_TOKEN', '').strip()
-CRCON_WS_TOKEN = RAW_CRCON_WS_TOKEN or (
-    (os.getenv('CRCON_API_KEY') or '').strip()
-)
+
+ENABLE_KILL_FEED = enable_kill_feed()
+CRCON_WS_URL = crcon_ws_url()
+RAW_CRCON_WS_TOKEN = (os.getenv('CRCON_WS_TOKEN') or '').strip()
+CRCON_WS_TOKEN = crcon_ws_token()
 TANK_EVENT_HISTORY_LIMIT = 25
 DEFAULT_TANK_WEAPON_KEYWORDS: Dict[str, List[str]] = {
     "cannon_shells": [
@@ -128,12 +134,10 @@ class APIKeyCRCONClient:
     """CRCON client using API key authentication"""
 
     def __init__(self):
-        self.base_url = os.getenv('CRCON_URL', 'http://localhost:8010')
-        self.api_key = os.getenv('CRCON_API_KEY')
+        self.base_url = crcon_url()
+        self.api_key = crcon_api_key()
         self.session = None
-        self.timeout = aiohttp.ClientTimeout(
-            total=int(os.getenv('CRCON_TIMEOUT', '15'))
-        )
+        self.timeout = aiohttp.ClientTimeout(total=crcon_timeout())
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -513,7 +517,14 @@ def detect_tank_kill(
 class KillFeedListener:
     """Consumes the CRCON WebSocket kill feed and fans out events."""
 
-    def __init__(self, url: str, token: str):
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        backoff_base: int = 5,
+        backoff_max: int = 60,
+        auth_fail_limit: int = 3,
+    ):
         self.url = url
         self.token = token or ""
         self._task: Optional[asyncio.Task] = None
@@ -521,6 +532,11 @@ class KillFeedListener:
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._callbacks: List[KillFeedCallback] = []
         self._connected = asyncio.Event()
+        self._backoff_base = backoff_base
+        self._backoff_max = backoff_max
+        self._auth_fail_limit = auth_fail_limit
+        self._auth_failures = 0
+        self.disabled_reason: Optional[str] = None
 
     @property
     def is_running(self) -> bool:
@@ -532,6 +548,9 @@ class KillFeedListener:
 
     def start(self):
         if self.is_running:
+            return
+        if self.disabled_reason:
+            logger.warning("Kill feed listener not started: %s", self.disabled_reason)
             return
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run(), name="crcon-kill-feed")
@@ -565,7 +584,7 @@ class KillFeedListener:
             return False
 
     async def _run(self):
-        backoff = 5
+        backoff = self._backoff_base
         while not self._stop_event.is_set():
             try:
                 headers = {}
@@ -582,14 +601,24 @@ class KillFeedListener:
                         heartbeat=30,
                     ) as ws:
                         logger.info("Kill feed connected")
+                        # Send subscription filter so CRCON knows which actions we want
+                        try:
+                            await ws.send_json({
+                                "last_seen_id": None,
+                                "actions": ["KILL"],
+                            })
+                        except Exception as sub_err:
+                            logger.warning("Failed to send kill feed subscription: %s", sub_err)
                         self._connected.set()
-                        backoff = 5
+                        self._auth_failures = 0
+                        backoff = self._backoff_base
                         async for msg in ws:
                             if self._stop_event.is_set():
                                 break
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 event = self._build_event(msg.data)
-                                await self._dispatch(event)
+                                if self._should_accept_event(event):
+                                    await self._dispatch(event)
                             elif msg.type in (
                                 aiohttp.WSMsgType.ERROR,
                                 aiohttp.WSMsgType.CLOSED,
@@ -603,23 +632,59 @@ class KillFeedListener:
                     "Kill feed disconnected, retrying in %ss",
                     backoff,
                 )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                await self._sleep_with_jitter(backoff)
+                backoff = min(backoff * 2, self._backoff_max)
             except asyncio.CancelledError:
                 break
+            except aiohttp.ClientResponseError as e:
+                self._connected.clear()
+                if self._stop_event.is_set():
+                    break
+                status = getattr(e, "status", None)
+                if status in (401, 403):
+                    self._auth_failures += 1
+                    logger.warning(
+                        "Kill feed auth error %s (attempt %s/%s).",
+                        status,
+                        self._auth_failures,
+                        self._auth_fail_limit,
+                    )
+                    if self._auth_failures >= self._auth_fail_limit:
+                        self.disabled_reason = f"Authentication failed ({status}) - check CRCON_WS_TOKEN"
+                        logger.error("Kill feed disabled: %s", self.disabled_reason)
+                        self._stop_event.set()
+                        break
+                else:
+                    logger.warning(
+                        "Kill feed HTTP error%s: %s. Retrying in %ss",
+                        f" {status}" if status is not None else "",
+                        e.message if hasattr(e, "message") else e,
+                        backoff,
+                    )
+                await self._sleep_with_jitter(backoff)
+                backoff = min(backoff * 2, self._backoff_max)
             except Exception as e:
                 self._connected.clear()
                 if self._stop_event.is_set():
                     break
-                logger.warning(
-                    "Kill feed error: %s. Retrying in %ss",
-                    e,
-                    backoff,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                logger.debug("Kill feed transient error: %s", e)
+                await self._sleep_with_jitter(backoff)
+                backoff = min(backoff * 2, self._backoff_max)
 
         logger.info("Kill feed listener stopped")
+
+    async def _sleep_with_jitter(self, backoff: float):
+        jitter = backoff * 0.3
+        await asyncio.sleep(backoff + random.uniform(0, jitter))
+
+    def _should_accept_event(self, event: KillFeedEvent) -> bool:
+        if event.payload is None:
+            logger.debug("Kill feed ignored empty payload")
+            return False
+        if isinstance(event.payload, str) and not event.payload.strip():
+            logger.debug("Kill feed ignored blank payload")
+            return False
+        return True
 
     def _build_event(self, raw_data: str) -> KillFeedEvent:
         payload: Any = None
@@ -2197,6 +2262,12 @@ async def killfeed_status(interaction: discord.Interaction):
             value=f"{running}\n{connected}\nQueue: {queue_size}/1000",
             inline=False
         )
+        if listener.disabled_reason:
+            embed.add_field(
+                name="Status",
+                value=f"🔴 Disabled: {listener.disabled_reason}",
+                inline=False
+            )
 
     channel_value = "None"
     if active_kill_feed_channel_id is not None:
