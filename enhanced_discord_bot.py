@@ -19,8 +19,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 from dotenv import load_dotenv
 from discord.ext import commands, tasks
-from discord import app_commands
-from datetime import timezone, timedelta
+from datetime import timezone
 
 # Set up logging
 logging.basicConfig(
@@ -45,10 +44,14 @@ GAME_END_THRESHOLD = 30  # Stop match when server time is below this
 MESSAGE_TRUNCATE_LENGTH = 1900  # Max length for test messages
 MIN_UPDATE_INTERVAL = 5  # Minimum seconds between updates
 MAX_UPDATE_INTERVAL = 300  # Maximum seconds between updates
-ENABLE_KILL_FEED = os.getenv('ENABLE_KILL_FEED', 'false').lower() == 'true'
+ENABLE_KILL_FEED = (
+    os.getenv('ENABLE_KILL_FEED', 'false').lower() == 'true'
+)
 CRCON_WS_URL = os.getenv('CRCON_WS_URL', '').strip()
 RAW_CRCON_WS_TOKEN = os.getenv('CRCON_WS_TOKEN', '').strip()
-CRCON_WS_TOKEN = RAW_CRCON_WS_TOKEN or (os.getenv('CRCON_API_KEY') or '').strip()
+CRCON_WS_TOKEN = RAW_CRCON_WS_TOKEN or (
+    (os.getenv('CRCON_API_KEY') or '').strip()
+)
 TANK_EVENT_HISTORY_LIMIT = 25
 DEFAULT_TANK_WEAPON_KEYWORDS: Dict[str, List[str]] = {
     "cannon_shells": [
@@ -87,7 +90,11 @@ def _parse_keyword_mapping(value: str) -> Optional[Dict[str, List[str]]]:
         try:
             data = json.loads(potential_path.read_text(encoding='utf-8'))
         except Exception as exc:
-            logger.warning(f"Failed to read tank keyword file {potential_path}: {exc}")
+            logger.warning(
+                "Failed to read tank keyword file %s: %s",
+                potential_path,
+                exc,
+            )
             return None
     else:
         try:
@@ -116,29 +123,39 @@ clocks = {}
 log_channel_str = os.getenv('LOG_CHANNEL_ID', '0')
 LOG_CHANNEL_ID = int(log_channel_str) if log_channel_str.isdigit() else 0
 
+
 class APIKeyCRCONClient:
     """CRCON client using API key authentication"""
-    
+
     def __init__(self):
         self.base_url = os.getenv('CRCON_URL', 'http://localhost:8010')
         self.api_key = os.getenv('CRCON_API_KEY')
         self.session = None
-        self.timeout = aiohttp.ClientTimeout(total=int(os.getenv('CRCON_TIMEOUT', '15')))
-    
+        self.timeout = aiohttp.ClientTimeout(
+            total=int(os.getenv('CRCON_TIMEOUT', '15'))
+        )
+
     async def __aenter__(self):
         """Async context manager entry"""
         if not self.api_key:
             raise Exception("CRCON_API_KEY not configured")
 
-        # Support both Bearer and x-api-key header styles - some CRCON builds expect one or the other
+        # Support both Bearer and x-api-key header styles.
+        # Some CRCON builds expect one or the other, so cycle through options.
         base_headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         }
         header_variants = [
-            ("bearer", {**base_headers, 'Authorization': f'Bearer {self.api_key}'}),
+            (
+                "bearer",
+                {**base_headers, 'Authorization': f'Bearer {self.api_key}'},
+            ),
             ("x-api-key", {**base_headers, 'x-api-key': self.api_key}),
-            ("raw-authorization", {**base_headers, 'Authorization': self.api_key})
+            (
+                "raw-authorization",
+                {**base_headers, 'Authorization': self.api_key},
+            ),
         ]
 
         last_status = None
@@ -149,22 +166,38 @@ class APIKeyCRCONClient:
             if self.session:
                 await self.session.close()
 
-            self.session = aiohttp.ClientSession(timeout=self.timeout, headers=headers)
+            self.session = aiohttp.ClientSession(
+                timeout=self.timeout,
+                headers=headers,
+            )
 
             try:
-                async with self.session.get(f"{self.base_url}/api/get_status") as response:
+                async with self.session.get(
+                    f"{self.base_url}/api/get_status"
+                ) as response:
                     last_status = response.status
                     if response.status == 200:
-                        logger.info(f"Successfully connected to CRCON with {variant_name} auth header")
+                        logger.info(
+                            "Successfully connected to CRCON with %s auth header",
+                            variant_name,
+                        )
                         return self
                     if response.status in (401, 403):
-                        logger.warning(f"CRCON {variant_name} auth rejected with {response.status}, trying fallback")
+                        logger.warning(
+                            "CRCON %s auth rejected with %s, trying fallback",
+                            variant_name,
+                            response.status,
+                        )
                         continue
                     # Other failures are treated as hard errors
                     raise Exception(f"CRCON connection failed: {response.status}")
             except Exception as e:
                 last_error = e
-                logger.debug(f"Error during CRCON connect with {variant_name} headers: {e}")
+                logger.debug(
+                    "Error during CRCON connect with %s headers: %s",
+                    variant_name,
+                    e,
+                )
                 continue
 
         # If we exhausted all header variants without success, clean up and raise a meaningful error
@@ -172,16 +205,21 @@ class APIKeyCRCONClient:
             await self.session.close()
 
         if last_status in (401, 403):
-            raise Exception("CRCON connection failed: unauthorized (tried Bearer, x-api-key, and Authorization headers). Verify API key and CRCON API access.")
+            raise Exception(
+                "CRCON connection failed: unauthorized (tried Bearer, x-api-key, and Authorization headers). "
+                "Verify API key and CRCON API access."
+            )
         if last_error:
             raise last_error
-        raise Exception("CRCON connection failed: unknown error while negotiating authentication")
-    
+        raise Exception(
+            "CRCON connection failed: unknown error while negotiating authentication"
+        )
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit"""
         if self.session:
             await self.session.close()
-    
+
     async def get_live_game_state(self):
         """Get comprehensive live game state"""
         try:
@@ -215,7 +253,7 @@ class APIKeyCRCONClient:
         except Exception as e:
             logger.error(f"Error getting game state: {e}")
             return None
-    
+
     async def _get_endpoint(self, endpoint):
         """Helper to get data from an endpoint"""
         try:
@@ -228,35 +266,35 @@ class APIKeyCRCONClient:
         except Exception as e:
             logger.error(f"Error getting {endpoint}: {e}")
             return {}
-    
+
     async def send_message(self, message: str):
         """Send message to all players individually"""
         try:
             # First get all connected players - UPDATED ENDPOINT
             logger.info(f"Getting player list to send message: {message}")
-            
+
             # FIXED: Using correct endpoint with underscore
             async with self.session.get(f"{self.base_url}/api/get_player_ids") as response:
                 if response.status != 200:
                     logger.warning(f"Failed to get player list: {response.status}")
                     return False
-                
+
                 player_data = await response.json()
                 logger.info(f"Player data response: {player_data}")
-                
+
                 # Extract player list from the result
                 if isinstance(player_data, dict) and 'result' in player_data:
                     players = player_data['result']
                 else:
                     players = player_data
-                
+
                 if not players:
                     logger.info("No players online to send message to")
                     return True
-                
+
                 success_count = 0
                 total_players = len(players)
-                
+
                 # Send message to each player individually
                 for player in players:
                     try:
@@ -269,7 +307,7 @@ class APIKeyCRCONClient:
                             player_id = player.get('steam_id_64', '')
                         else:
                             continue
-                        
+
                         # Send individual message
                         payload = {
                             "player_name": player_name,
@@ -277,24 +315,39 @@ class APIKeyCRCONClient:
                             "message": message,
                             "by": os.getenv('BOT_NAME', 'HLLTankBot')
                         }
-                        
-                        async with self.session.post(f"{self.base_url}/api/message_player", json=payload) as msg_response:
+
+                        async with self.session.post(
+                            f"{self.base_url}/api/message_player",
+                            json=payload,
+                        ) as msg_response:
                             if msg_response.status == 200:
                                 success_count += 1
-                                logger.debug(f"Message sent to {player_name}")
+                                logger.debug(
+                                    "Message sent to %s",
+                                    player_name,
+                                )
                             else:
-                                logger.debug(f"Failed to message {player_name}: {msg_response.status}")
-                                
+                                logger.debug(
+                                    "Failed to message %s: %s",
+                                    player_name,
+                                    msg_response.status,
+                                )
+
                     except Exception as e:
-                        logger.debug(f"Error messaging individual player: {e}")
+                        logger.debug("Error messaging individual player: %s", e)
                         continue
-                
-                logger.info(f"Message sent to {success_count}/{total_players} players")
+
+                logger.info(
+                    "Message sent to %s/%s players",
+                    success_count,
+                    total_players,
+                )
                 return success_count > 0
-                
+
         except Exception as e:
-            logger.error(f"Error sending message to all players: {e}")
+            logger.error("Error sending message to all players: %s", e)
             return False
+
 
 @dataclass
 class KillFeedEvent:
@@ -376,21 +429,47 @@ def _match_keywords(texts: List[str], keywords: Dict[str, List[str]]) -> Tuple[O
 
 def _looks_like_tank_vehicle(text: str) -> bool:
     lowered = text.lower()
-    return any(token in lowered for token in ["tank", "armor", "armour", "vehicle", "panzer", "sherman"])
+    tokens = [
+        "tank",
+        "armor",
+        "armour",
+        "vehicle",
+        "panzer",
+        "sherman",
+    ]
+    return any(token in lowered for token in tokens)
 
 
-def detect_tank_kill(payload: Any, keyword_mapping: Optional[Dict[str, List[str]]] = None) -> Optional[TankKillDetection]:
+def detect_tank_kill(
+    payload: Any,
+    keyword_mapping: Optional[Dict[str, List[str]]] = None,
+) -> Optional[TankKillDetection]:
     keywords = keyword_mapping or TANK_WEAPON_KEYWORDS
     data = _flatten_kill_payload(payload)
     if not isinstance(data, dict):
         return None
 
-    weapon_text = _extract_value(data, ['weapon', 'weapon_name', 'weapon_id', 'message', 'line_without_timestamp'])
-    vehicle_text = _extract_value(data, ['target_vehicle', 'victim_vehicle', 'vehicle', 'destroyed_vehicle'])
-    vehicle_class = _extract_value(data, ['target_vehicle_class', 'victim_vehicle_class', 'vehicle_class'])
-    subtype = _extract_value(data, ['sub_type', 'category', 'type'])
+    weapon_text = _extract_value(
+        data,
+        ['weapon', 'weapon_name', 'weapon_id', 'message', 'line_without_timestamp'],
+    )
+    vehicle_text = _extract_value(
+        data,
+        ['target_vehicle', 'victim_vehicle', 'vehicle', 'destroyed_vehicle'],
+    )
+    vehicle_class = _extract_value(
+        data,
+        ['target_vehicle_class', 'victim_vehicle_class', 'vehicle_class'],
+    )
+    subtype = _extract_value(
+        data,
+        ['sub_type', 'category', 'type'],
+    )
 
-    keyword_group, keyword_match = _match_keywords([weapon_text, vehicle_text], keywords)
+    keyword_group, keyword_match = _match_keywords(
+        [weapon_text, vehicle_text],
+        keywords,
+    )
     if not keyword_group and vehicle_class and _looks_like_tank_vehicle(vehicle_class):
         keyword_group, keyword_match = 'vehicle_class', vehicle_class
     if not keyword_group and subtype and _looks_like_tank_vehicle(subtype):
@@ -400,10 +479,22 @@ def detect_tank_kill(payload: Any, keyword_mapping: Optional[Dict[str, List[str]
     if not keyword_group:
         return None
 
-    killer_name = _extract_value(data, ['killer_name', 'attacker_name', 'player_name_1', 'source_player', 'player', 'instigator'])
-    killer_team = _extract_value(data, ['killer_team', 'attacker_team', 'player_team_1', 'team'])
-    victim_name = _extract_value(data, ['victim_name', 'target_name', 'player_name_2', 'killed_player'])
-    victim_team = _extract_value(data, ['victim_team', 'target_team', 'player_team_2'])
+    killer_name = _extract_value(
+        data,
+        ['killer_name', 'attacker_name', 'player_name_1', 'source_player', 'player', 'instigator'],
+    )
+    killer_team = _extract_value(
+        data,
+        ['killer_team', 'attacker_team', 'player_team_1', 'team'],
+    )
+    victim_name = _extract_value(
+        data,
+        ['victim_name', 'target_name', 'player_name_2', 'killed_player'],
+    )
+    victim_team = _extract_value(
+        data,
+        ['victim_team', 'target_team', 'player_team_2'],
+    )
     vehicle_name = vehicle_text or vehicle_class or subtype
 
     return TankKillDetection(
@@ -477,11 +568,19 @@ class KillFeedListener:
         backoff = 5
         while not self._stop_event.is_set():
             try:
-                headers = {'Authorization': f'Bearer {self.token}'} if self.token else {}
+                headers = {}
+                if self.token:
+                    headers['Authorization'] = f'Bearer {self.token}'
                 async with aiohttp.ClientSession(headers=headers) as session:
                     safe_url = _sanitize_ws_url(self.url)
-                    logger.info(f"Connecting to CRCON kill feed at {safe_url}")
-                    async with session.ws_connect(self.url, heartbeat=30) as ws:
+                    logger.info(
+                        "Connecting to CRCON kill feed at %s",
+                        safe_url,
+                    )
+                    async with session.ws_connect(
+                        self.url,
+                        heartbeat=30,
+                    ) as ws:
                         logger.info("Kill feed connected")
                         self._connected.set()
                         backoff = 5
@@ -491,12 +590,19 @@ class KillFeedListener:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 event = self._build_event(msg.data)
                                 await self._dispatch(event)
-                            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
+                            elif msg.type in (
+                                aiohttp.WSMsgType.ERROR,
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.CLOSE,
+                            ):
                                 break
                 self._connected.clear()
                 if self._stop_event.is_set():
                     break
-                logger.warning(f"Kill feed disconnected, retrying in {backoff}s")
+                logger.warning(
+                    "Kill feed disconnected, retrying in %ss",
+                    backoff,
+                )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             except asyncio.CancelledError:
@@ -505,7 +611,11 @@ class KillFeedListener:
                 self._connected.clear()
                 if self._stop_event.is_set():
                     break
-                logger.warning(f"Kill feed error: {e}. Retrying in {backoff}s")
+                logger.warning(
+                    "Kill feed error: %s. Retrying in %ss",
+                    e,
+                    backoff,
+                )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 
@@ -780,7 +890,7 @@ class ClockState:
     def get_live_status(self, team):
         """Get live status with current timing info"""
         total = self.total_time(team)
-        
+
         if self.active == team and self.clock_started:
             # Currently active - they're defending the point they control
             current_elapsed = self.get_current_elapsed()
@@ -817,7 +927,7 @@ class ClockState:
             logger.error(f"Failed to connect to CRCON: {e}")
             self.crcon_client = None
             return False
-    
+
     async def update_from_game(self):
         """Update from CRCON game data"""
         if not self.crcon_client:
@@ -853,40 +963,46 @@ class ClockState:
 
         except Exception as e:
             logger.error(f"Error updating from game: {e}")
-    
+
     async def _check_score_changes(self):
         """Check for captures to trigger auto-switch - focus on point control"""
         if not self.game_data or 'game_state' not in self.game_data:
             return
-        
+
         game_state = self.game_data['game_state']
-        
+
         # Parse your CRCON's result format for scores
         current_allied = 0
         current_axis = 0
-        
+
         if isinstance(game_state, dict) and 'result' in game_state:
             result = game_state['result']
             if isinstance(result, dict):
                 current_allied = result.get('allied_score', 0)
                 current_axis = result.get('axis_score', 0)
-        
+
         # Debug logging to see what's happening
-        logger.info(f"Score check - Allied: {self.last_scores['allied']} -> {current_allied}, Axis: {self.last_scores['axis']} -> {current_axis}")
-        
+        logger.info(
+            "Score check - Allied: %s -> %s, Axis: %s -> %s",
+            self.last_scores['allied'],
+            current_allied,
+            self.last_scores['axis'],
+            current_axis,
+        )
+
         # Check for score increases (point captures)
         if current_allied > self.last_scores['allied']:
-            logger.info(f"Allied score increased! Switching to Allies")
+            logger.info("Allied score increased! Switching to Allies")
             await self._auto_switch_to('A', "Allies captured the center point")
         elif current_axis > self.last_scores['axis']:
-            logger.info(f"Axis score increased! Switching to Axis") 
+            logger.info("Axis score increased! Switching to Axis")
             await self._auto_switch_to('B', "Axis captured the center point")
         else:
-            logger.debug(f"No score changes detected")
-        
+            logger.debug("No score changes detected")
+
         # Update last known scores
         self.last_scores = {'allied': current_allied, 'axis': current_axis}
-    
+
     async def _auto_switch_to(self, team: str, reason: str = "Auto-switch"):
         """Auto-switch teams with proper time tracking"""
         if self.active == team:
@@ -920,32 +1036,50 @@ class ClockState:
             # Start the clock if this is the first switch
             if not self.clock_started:
                 self.clock_started = True
-        
+
         # Send notification to game with DMT scores
         if self.crcon_client:
-            team_name = self.team_names.get('allied' if team == 'A' else 'axis', 'Allies' if team == 'A' else 'Axis')
+            team_name = self.team_names.get(
+                'allied' if team == 'A' else 'axis',
+                'Allies' if team == 'A' else 'Axis',
+            )
             allied_scores = self.calculate_dmt_score('allied')
             axis_scores = self.calculate_dmt_score('axis')
             team_a_name = self.team_names['allied']
             team_b_name = self.team_names['axis']
 
-            tank_line = self.format_tank_scoreline()
-            msg = (
-                f"🔄 {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | "
-                f"{team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT\n{tank_line}"
+            allied_combat = allied_scores['combat_total']
+            allied_cap = allied_scores['cap_score']
+            allied_total = allied_scores['total_dmt']
+            axis_combat = axis_scores['combat_total']
+            axis_cap = axis_scores['cap_score']
+            axis_total = axis_scores['total_dmt']
+
+            allies_summary = (
+                f"{team_a_name}: Combat {allied_combat:,.0f} + "
+                f"Cap {allied_cap:,.0f} = {allied_total:,.0f} DMT"
             )
+            axis_summary = (
+                f"{team_b_name}: Combat {axis_combat:,.0f} + "
+                f"Cap {axis_cap:,.0f} = {axis_total:,.0f} DMT"
+            )
+
+            tank_line = self.format_tank_scoreline()
+            msg_header = f"🔄 {team_name} captured the point!"
+            msg = " | ".join([msg_header, allies_summary, axis_summary])
+            msg = f"{msg}\n{tank_line}"
             await self.crcon_client.send_message(msg)
-        
+
         # IMPORTANT: Update the Discord embed immediately
         if self.message:
             success = await safe_edit_message(self.message, embed=build_embed(self))
             if success:
-                logger.info(f"Discord embed updated after auto-switch to {team}")
+                logger.info("Discord embed updated after auto-switch to %s", team)
             else:
                 self.message = None
-            
-        logger.info(f"Auto-switched to team {team}: {reason}")
-    
+
+            logger.info("Auto-switched to team %s: %s", team, reason)
+
     def get_game_info(self):
         """Get formatted game information"""
         if not self.game_data:
@@ -955,14 +1089,13 @@ class ClockState:
                 'game_time': 0,
                 'connection_status': 'Disconnected'
             }
-        
+
         game_state = self.game_data.get('game_state', {})
-        team_view = self.game_data.get('team_view', {})
         map_info = self.game_data.get('map_info', {})
-        
+
         # Extract map name - handle your CRCON's result wrapper
         current_map = 'Unknown'
-        
+
         if isinstance(map_info, dict) and 'result' in map_info:
             result = map_info['result']
             if isinstance(result, dict):
@@ -972,7 +1105,7 @@ class ClockState:
                 # Fallback to nested map object
                 elif 'map' in result and isinstance(result['map'], dict):
                     current_map = result['map'].get('pretty_name', result['map'].get('name', 'Unknown'))
-        
+
         # Extract player count from your CRCON result format
         player_count = 0
         if isinstance(game_state, dict) and 'result' in game_state:
@@ -993,7 +1126,7 @@ class ClockState:
                     if isinstance(players_data, dict):
                         # Count players in the dictionary
                         player_count = len(players_data)
-        
+
         # Extract game time from your CRCON result format - convert to remaining time display
         game_time_remaining = 0
         if isinstance(game_state, dict) and 'result' in game_state:
@@ -1003,20 +1136,20 @@ class ClockState:
                 raw_time = result.get('time_remaining', 0)
                 if raw_time > 0:
                     game_time_remaining = raw_time
-        
+
         # Track scores internally for auto-switch using your CRCON format
         allied_score = 0
         axis_score = 0
-        
+
         if isinstance(game_state, dict) and 'result' in game_state:
             result = game_state['result']
             if isinstance(result, dict):
                 allied_score = result.get('allied_score', 0)
                 axis_score = result.get('axis_score', 0)
-        
+
         # Store scores for auto-switch logic
         self.last_scores = {'allied': allied_score, 'axis': axis_score}
-        
+
         return {
             'map': current_map,
             'players': player_count,
@@ -1242,9 +1375,11 @@ class ClockState:
             if len(self.tank_kill_events) > TANK_EVENT_HISTORY_LIMIT:
                 self.tank_kill_events = self.tank_kill_events[-TANK_EVENT_HISTORY_LIMIT:]
 
+
 def user_is_admin(interaction: discord.Interaction):
     admin_role = os.getenv('ADMIN_ROLE_NAME', 'admin').lower()
     return any(role.name.lower() == admin_role for role in interaction.user.roles)
+
 
 async def safe_edit_message(message, **kwargs):
     """Safely edit a Discord message with error handling"""
@@ -1279,6 +1414,7 @@ def build_tank_kill_field(clock: 'ClockState', include_last: bool = False) -> st
             lines.append("Last: _No tank kills yet_")
     return "\n".join(lines)
 
+
 def build_embed(clock: ClockState):
     """Build Discord embed with DMT Scoring"""
     embed = discord.Embed(
@@ -1291,33 +1427,45 @@ def build_embed(clock: ClockState):
     game_info = clock.get_game_info()
 
     # Start with map and players
-    embed.description += f"\n🗺️ **Map:** {game_info['map']}\n👥 **Players:** {game_info['players']}/100"
+    embed.description += (
+        f"\n🗺️ **Map:** {game_info['map']}"
+        f"\n👥 **Players:** {game_info['players']}/100"
+    )
 
     # Add server game time instead of match duration
     if game_info['game_time'] > 0:
-        embed.description += f"\n⏰ **Server Game Time:** `{clock.format_time(game_info['game_time'])}`"
-    
+        embed.description += (
+            f"\n⏰ **Server Game Time:** "
+            f"`{clock.format_time(game_info['game_time'])}`"
+        )
+
     # Get live status for both teams
     allies_status = clock.get_live_status('A')
     axis_status = clock.get_live_status('B')
-    
+
     # Build team information focused on TIME CONTROL
-    allies_value = f"**Control Time:** `{clock.format_time(allies_status['total_time'])}`\n**Status:** {allies_status['status']}"
-    axis_value = f"**Control Time:** `{clock.format_time(axis_status['total_time'])}`\n**Status:** {axis_status['status']}"
-    
+    allies_value = (
+        f"**Control Time:** `{clock.format_time(allies_status['total_time'])}`\n"
+        f"**Status:** {allies_status['status']}"
+    )
+    axis_value = (
+        f"**Control Time:** `{clock.format_time(axis_status['total_time'])}`\n"
+        f"**Status:** {axis_status['status']}"
+    )
+
     # Add current session info for active team
     if allies_status['is_active'] and allies_status['current_session'] > 0:
         allies_value += f"\n**Current Hold:** `{clock.format_time(allies_status['current_session'])}`"
     elif axis_status['is_active'] and axis_status['current_session'] > 0:
         axis_value += f"\n**Current Hold:** `{clock.format_time(axis_status['current_session'])}`"
-    
+
     # Add time advantage calculation
     time_diff = abs(allies_status['total_time'] - axis_status['total_time'])
     if allies_status['total_time'] > axis_status['total_time']:
         allies_value += f"\n**Advantage:** `+{clock.format_time(time_diff)}`"
     elif axis_status['total_time'] > allies_status['total_time']:
         axis_value += f"\n**Advantage:** `+{clock.format_time(time_diff)}`"
-    
+
     # Get team names
     allied_name = clock.team_names.get('allied', 'Allies')
     axis_name = clock.team_names.get('axis', 'Axis')
@@ -1351,17 +1499,18 @@ def build_embed(clock: ClockState):
         leader_text = "⚖️ **Tied**"
 
     embed.add_field(name="📊 Current Leader", value=leader_text, inline=False)
-    
+
     # Footer with connection status
-    connection_status = f"🟢 CRCON Connected" if clock.crcon_client else "🔴 CRCON Disconnected"
+    connection_status = "🟢 CRCON Connected" if clock.crcon_client else "🔴 CRCON Disconnected"
     auto_status = " | 🤖 Auto ON" if clock.auto_switch else " | 🤖 Auto OFF"
-    
+
     footer_text = f"Match Clock by {os.getenv('BOT_AUTHOR', 'StoneyRebel')} | {connection_status}{auto_status}"
     if game_info.get('last_update'):
         footer_text += f" | Updated: {game_info['last_update']}"
-    
+
     embed.set_footer(text=footer_text)
     return embed
+
 
 class StartControls(discord.ui.View):
     def __init__(self, channel_id):
@@ -1371,7 +1520,10 @@ class StartControls(discord.ui.View):
     @discord.ui.button(label="▶️ Start Match", style=discord.ButtonStyle.success)
     async def start_match(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not user_is_admin(interaction):
-            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Admin role required.",
+                ephemeral=True,
+            )
 
         # Respond to Discord immediately to prevent timeout
         await interaction.response.defer()
@@ -1401,7 +1553,10 @@ class StartControls(discord.ui.View):
             # Send start message with DMT scoring info
             team_a = clock.team_names['allied']
             team_b = clock.team_names['axis']
-            start_msg = f"🏆 HLL Tank Overwatch: {team_a} vs {team_b} | DMT Scoring Active | Combat + Cap Time = Total Score"
+            start_msg = (
+                f"🏆 HLL Tank Overwatch: {team_a} vs {team_b} | "
+                "DMT Scoring Active | Combat + Cap Time = Total Score"
+            )
 
             await clock.crcon_client.send_message(start_msg)
             await interaction.edit_original_response(content="✅ Match started with CRCON!")
@@ -1411,18 +1566,18 @@ class StartControls(discord.ui.View):
     @discord.ui.button(label="🔗 Test CRCON", style=discord.ButtonStyle.secondary)
     async def test_crcon(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        
+
         try:
             test_client = APIKeyCRCONClient()
             async with test_client as client:
                 live_data = await client.get_live_game_state()
-                
+
                 if live_data:
                     game_state = live_data.get('game_state', {})
                     map_info = live_data.get('map_info', {})
                     embed = discord.Embed(title="🟢 CRCON Test - SUCCESS", color=0x00ff00)
                     embed.add_field(name="Status", value="✅ Connected", inline=True)
-                    
+
                     # Extract map name
                     map_name = 'Unknown'
                     if isinstance(map_info, dict):
@@ -1432,18 +1587,19 @@ class StartControls(discord.ui.View):
                             map_name = map_info['name']
                         elif 'map' in map_info and isinstance(map_info['map'], dict):
                             map_name = map_info['map'].get('pretty_name', 'Unknown')
-                    
+
                     embed.add_field(name="Map", value=map_name, inline=True)
                     embed.add_field(name="Players", value=f"{game_state.get('nb_players', 0)}/100", inline=True)
                 else:
                     embed = discord.Embed(title="🟡 CRCON Test - PARTIAL", color=0xffaa00)
                     embed.add_field(name="Status", value="Connected but no data", inline=False)
-                    
+
         except Exception as e:
             embed = discord.Embed(title="🔴 CRCON Test - FAILED", color=0xff0000)
             embed.add_field(name="Error", value=str(e)[:1000], inline=False)
-        
+
         await interaction.followup.send(embed=embed, ephemeral=True)
+
 
 class TimerControls(discord.ui.View):
     def __init__(self, channel_id):
@@ -1462,15 +1618,15 @@ class TimerControls(discord.ui.View):
     async def toggle_auto_switch(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not user_is_admin(interaction):
             return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
-        
+
         clock = clocks[self.channel_id]
         clock.auto_switch = not clock.auto_switch
-        
+
         status = "enabled" if clock.auto_switch else "disabled"
 
         await interaction.response.defer()
         await safe_edit_message(clock.message, embed=build_embed(clock), view=self)
-        
+
         if clock.crcon_client:
             await clock.crcon_client.send_message(f"🤖 Auto-switch {status}")
 
@@ -1478,36 +1634,36 @@ class TimerControls(discord.ui.View):
     async def show_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
         clock = clocks[self.channel_id]
         await interaction.response.defer(ephemeral=True)
-        
+
         if not clock.crcon_client:
             return await interaction.followup.send("❌ CRCON not connected.", ephemeral=True)
-        
+
         try:
             await clock.update_from_game()
             game_info = clock.get_game_info()
-            
+
             embed = discord.Embed(title="📊 Live Match Stats", color=0x00ff00)
             embed.add_field(name="🗺️ Map", value=game_info['map'], inline=True)
             embed.add_field(name="👥 Players", value=f"{game_info['players']}/100", inline=True)
             embed.add_field(name="🔄 Point Switches", value=str(len(clock.switches)), inline=True)
-            
+
             # Control time breakdown
             allies_time = clock.total_time('A')
             axis_time = clock.total_time('B')
             total_control = allies_time + axis_time
-            
+
             if total_control > 0:
                 allies_percent = (allies_time / total_control) * 100
                 axis_percent = (axis_time / total_control) * 100
-                
+
                 embed.add_field(name="🇺🇸 Allies Control", value=f"{allies_percent:.1f}%", inline=True)
                 embed.add_field(name="🇩🇪 Axis Control", value=f"{axis_percent:.1f}%", inline=True)
-            
+
             embed.add_field(name="🤖 Auto-Switch", value="On" if clock.auto_switch else "Off", inline=True)
             embed.add_field(name="📡 Last Update", value=game_info['last_update'], inline=True)
-            
+
             await interaction.followup.send(embed=embed, ephemeral=True)
-            
+
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
@@ -1533,7 +1689,10 @@ class TimerControls(discord.ui.View):
     @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger)
     async def stop_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not user_is_admin(interaction):
-            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Admin role required.",
+                ephemeral=True,
+            )
 
         clock = clocks[self.channel_id]
 
@@ -1564,10 +1723,26 @@ class TimerControls(discord.ui.View):
                 winner_msg = "DRAW!"
 
             tank_line = clock.format_tank_scoreline()
-            await clock.crcon_client.send_message(
-                f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | "
-                f"{team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT\n{tank_line}"
+            allied_combat = allied_scores['combat_total']
+            allied_cap = allied_scores['cap_score']
+            allied_total = allied_scores['total_dmt']
+            axis_combat = axis_scores['combat_total']
+            axis_cap = axis_scores['cap_score']
+            axis_total = axis_scores['total_dmt']
+
+            allies_summary = (
+                f"{team_a_name}: Combat {allied_combat:,.0f} + "
+                f"Cap {allied_cap:,.0f} = {allied_total:,.0f} DMT"
             )
+            axis_summary = (
+                f"{team_b_name}: Combat {axis_combat:,.0f} + "
+                f"Cap {axis_cap:,.0f} = {axis_total:,.0f} DMT"
+            )
+
+            msg_header = f"🏁 MATCH COMPLETE! {winner_msg}"
+            msg = " | ".join([msg_header, allies_summary, axis_summary])
+            msg = f"{msg}\n{tank_line}"
+            await clock.crcon_client.send_message(msg)
 
         # Create final embed with DMT scores
         allied_scores = clock.calculate_dmt_score('allied')
@@ -1583,17 +1758,33 @@ class TimerControls(discord.ui.View):
             embed.add_field(name="👥 Players", value=f"{game_info['players']}/100", inline=True)
 
         # Final DMT scores
+        allied_value = (
+            f"**{allied_scores['total_dmt']:,.1f} DMT**\n"
+            f"Combat: {allied_scores['combat_total']:,.0f}\n"
+            f"Cap: {allied_scores['cap_score']:,.1f} "
+            f"({clock.format_time(clock.time_a)})"
+        )
+        axis_value = (
+            f"**{axis_scores['total_dmt']:,.1f} DMT**\n"
+            f"Combat: {axis_scores['combat_total']:,.0f}\n"
+            f"Cap: {axis_scores['cap_score']:,.1f} "
+            f"({clock.format_time(clock.time_b)})"
+        )
         embed.add_field(
             name=f"🇺🇸 {team_a_name} - Final DMT",
-            value=f"**{allied_scores['total_dmt']:,.1f} DMT**\nCombat: {allied_scores['combat_total']:,.0f}\nCap: {allied_scores['cap_score']:,.1f} ({clock.format_time(clock.time_a)})",
-            inline=True
+            value=allied_value,
+            inline=True,
         )
         embed.add_field(
             name=f"🇩🇪 {team_b_name} - Final DMT",
-            value=f"**{axis_scores['total_dmt']:,.1f} DMT**\nCombat: {axis_scores['combat_total']:,.0f}\nCap: {axis_scores['cap_score']:,.1f} ({clock.format_time(clock.time_b)})",
-            inline=True
+            value=axis_value,
+            inline=True,
         )
-        embed.add_field(name="💥 Tank Kills", value=build_tank_kill_field(clock, include_last=True), inline=False)
+        embed.add_field(
+            name="💥 Tank Kills",
+            value=build_tank_kill_field(clock, include_last=True),
+            inline=False,
+        )
 
         # Determine winner by DMT score
         if allied_scores['total_dmt'] > axis_scores['total_dmt']:
@@ -1618,7 +1809,10 @@ class TimerControls(discord.ui.View):
 
     async def _switch_team(self, interaction: discord.Interaction, team: str):
         if not user_is_admin(interaction):
-            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Admin role required.",
+                ephemeral=True,
+            )
 
         clock = clocks[self.channel_id]
 
@@ -1655,36 +1849,55 @@ class TimerControls(discord.ui.View):
 
         # Send notification with DMT scores
         if clock.crcon_client:
-            team_name = clock.team_names.get('allied' if team == 'A' else 'axis', 'Allies' if team == 'A' else 'Axis')
+            team_name = clock.team_names.get(
+                'allied' if team == 'A' else 'axis',
+                'Allies' if team == 'A' else 'Axis',
+            )
             allied_scores = clock.calculate_dmt_score('allied')
             axis_scores = clock.calculate_dmt_score('axis')
             team_a_name = clock.team_names['allied']
             team_b_name = clock.team_names['axis']
 
             tank_line = clock.format_tank_scoreline()
-            msg = (
-                f"⚔️ {team_name} captured the point! | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | "
-                f"{team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT\n{tank_line}"
+            allied_combat = allied_scores['combat_total']
+            allied_cap = allied_scores['cap_score']
+            allied_total = allied_scores['total_dmt']
+            axis_combat = axis_scores['combat_total']
+            axis_cap = axis_scores['cap_score']
+            axis_total = axis_scores['total_dmt']
+
+            allies_summary = (
+                f"{team_a_name}: Combat {allied_combat:,.0f} + "
+                f"Cap {allied_cap:,.0f} = {allied_total:,.0f} DMT"
             )
+            axis_summary = (
+                f"{team_b_name}: Combat {axis_combat:,.0f} + "
+                f"Cap {axis_cap:,.0f} = {axis_total:,.0f} DMT"
+            )
+
+            msg_header = f"⚔️ {team_name} captured the point!"
+            msg = " | ".join([msg_header, allies_summary, axis_summary])
+            msg = f"{msg}\n{tank_line}"
             await clock.crcon_client.send_message(msg)
 
         await interaction.response.defer()
         await safe_edit_message(clock.message, embed=build_embed(clock), view=self)
 
+
 async def log_results(clock: ClockState, game_info: dict):
     """Log match results focused on time control"""
     if not LOG_CHANNEL_ID:
         return
-        
+
     results_channel = bot.get_channel(LOG_CHANNEL_ID)
     if not results_channel:
         return
-    
+
     embed = discord.Embed(title="🏁 HLL Tank Overwatch Match Complete", color=0x800020)
     embed.add_field(name="🇺🇸 Allies Control Time", value=f"`{clock.format_time(clock.time_a)}`", inline=True)
     embed.add_field(name="🇩🇪 Axis Control Time", value=f"`{clock.format_time(clock.time_b)}`", inline=True)
     embed.add_field(name="💥 Tank Kills", value=build_tank_kill_field(clock), inline=True)
-    
+
     # Winner by time control
     if clock.time_a > clock.time_b:
         winner = "🏆 Allies"
@@ -1695,19 +1908,21 @@ async def log_results(clock: ClockState, game_info: dict):
     else:
         winner = "🤝 Draw"
         advantage = "0:00:00"
-    
+
     embed.add_field(name="Winner", value=winner, inline=True)
     embed.add_field(name="Advantage", value=f"`+{advantage}`", inline=True)
-    
+
     if game_info['connection_status'] == 'Connected':
         embed.add_field(name="🗺️ Map", value=game_info['map'], inline=True)
-    
+
     embed.add_field(name="🔄 Switches", value=str(len(clock.switches)), inline=True)
     embed.timestamp = datetime.datetime.now(timezone.utc)
-    
+
     await results_channel.send(embed=embed)
 
 # Validate and parse update interval
+
+
 def get_update_interval():
     """Get and validate update interval from environment"""
     try:
@@ -1715,10 +1930,12 @@ def get_update_interval():
         # Clamp to reasonable bounds
         return max(MIN_UPDATE_INTERVAL, min(interval, MAX_UPDATE_INTERVAL))
     except ValueError:
-        logger.warning(f"Invalid UPDATE_INTERVAL, using default: 15")
+        logger.warning("Invalid UPDATE_INTERVAL, using default: 15")
         return 15
 
 # Update task - shows in-game time
+
+
 @tasks.loop(seconds=get_update_interval())
 async def match_updater(channel_id):
     """Update match display with live game time"""
@@ -1751,6 +1968,7 @@ async def match_updater(channel_id):
     except Exception as e:
         logger.error(f"Error in match updater: {e}")
 
+
 async def auto_stop_match(clock: ClockState, game_info: dict):
     """Automatically stop match when game time ends"""
     try:
@@ -1781,10 +1999,26 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
                 winner_msg = "DRAW!"
 
             tank_line = clock.format_tank_scoreline()
-            await clock.crcon_client.send_message(
-                f"🏁 MATCH COMPLETE! {winner_msg} | {team_a_name}: Combat {allied_scores['combat_total']:,.0f} + Cap {allied_scores['cap_score']:,.0f} = {allied_scores['total_dmt']:,.0f} DMT | "
-                f"{team_b_name}: Combat {axis_scores['combat_total']:,.0f} + Cap {axis_scores['cap_score']:,.0f} = {axis_scores['total_dmt']:,.0f} DMT\n{tank_line}"
+            allied_combat = allied_scores['combat_total']
+            allied_cap = allied_scores['cap_score']
+            allied_total = allied_scores['total_dmt']
+            axis_combat = axis_scores['combat_total']
+            axis_cap = axis_scores['cap_score']
+            axis_total = axis_scores['total_dmt']
+
+            allies_summary = (
+                f"{team_a_name}: Combat {allied_combat:,.0f} + "
+                f"Cap {allied_cap:,.0f} = {allied_total:,.0f} DMT"
             )
+            axis_summary = (
+                f"{team_b_name}: Combat {axis_combat:,.0f} + "
+                f"Cap {axis_cap:,.0f} = {axis_total:,.0f} DMT"
+            )
+
+            msg_header = f"🏁 MATCH COMPLETE! {winner_msg}"
+            msg = " | ".join([msg_header, allies_summary, axis_summary])
+            msg = f"{msg}\n{tank_line}"
+            await clock.crcon_client.send_message(msg)
 
         # Create final embed with DMT scores
         allied_scores = clock.calculate_dmt_score('allied')
@@ -1800,17 +2034,33 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
             embed.add_field(name="👥 Players", value=f"{game_info['players']}/100", inline=True)
 
         # Final DMT scores
+        allied_value = (
+            f"**{allied_scores['total_dmt']:,.1f} DMT**\n"
+            f"Combat: {allied_scores['combat_total']:,.0f}\n"
+            f"Cap: {allied_scores['cap_score']:,.1f} "
+            f"({clock.format_time(clock.time_a)})"
+        )
+        axis_value = (
+            f"**{axis_scores['total_dmt']:,.1f} DMT**\n"
+            f"Combat: {axis_scores['combat_total']:,.0f}\n"
+            f"Cap: {axis_scores['cap_score']:,.1f} "
+            f"({clock.format_time(clock.time_b)})"
+        )
         embed.add_field(
             name=f"🇺🇸 {team_a_name} - Final DMT",
-            value=f"**{allied_scores['total_dmt']:,.1f} DMT**\nCombat: {allied_scores['combat_total']:,.0f}\nCap: {allied_scores['cap_score']:,.1f} ({clock.format_time(clock.time_a)})",
-            inline=True
+            value=allied_value,
+            inline=True,
         )
         embed.add_field(
             name=f"🇩🇪 {team_b_name} - Final DMT",
-            value=f"**{axis_scores['total_dmt']:,.1f} DMT**\nCombat: {axis_scores['combat_total']:,.0f}\nCap: {axis_scores['cap_score']:,.1f} ({clock.format_time(clock.time_b)})",
-            inline=True
+            value=axis_value,
+            inline=True,
         )
-        embed.add_field(name="💥 Tank Kills", value=build_tank_kill_field(clock, include_last=True), inline=False)
+        embed.add_field(
+            name="💥 Tank Kills",
+            value=build_tank_kill_field(clock, include_last=True),
+            inline=False,
+        )
 
         # Determine winner by DMT score
         if allied_scores['total_dmt'] > axis_scores['total_dmt']:
@@ -1827,7 +2077,7 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
 
         # Update the message with final results
         await safe_edit_message(clock.message, embed=embed, view=None)
-        
+
         # Also post to the channel (not just edit the existing message)
         channel = clock.message.channel
         await channel.send("🏁 **MATCH COMPLETE!** 🏁", embed=embed)
@@ -1844,6 +2094,8 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
         logger.error(f"Error in auto_stop_match: {e}")
 
 # Bot commands
+
+
 @bot.tree.command(name="reverse_clock", description="Start the HLL Tank Overwatch time control clock")
 async def reverse_clock(interaction: discord.Interaction):
     channel_id = interaction.channel_id
@@ -1855,6 +2107,7 @@ async def reverse_clock(interaction: discord.Interaction):
     await interaction.response.send_message("✅ HLL Tank Overwatch clock ready!", ephemeral=True)
     posted_message = await interaction.channel.send(embed=embed, view=view)
     clocks[channel_id].message = posted_message
+
 
 @bot.tree.command(name="crcon_status", description="Check CRCON connection status")
 async def crcon_status(interaction: discord.Interaction):
@@ -1900,107 +2153,120 @@ async def crcon_status(interaction: discord.Interaction):
             else:
                 embed.add_field(name="Connection", value="🟡 Connected", inline=True)
                 embed.add_field(name="Data", value="❌ No data", inline=True)
-                
+
     except Exception as e:
         embed.add_field(name="Connection", value="❌ Failed", inline=True)
         embed.add_field(name="Error", value=str(e)[:500], inline=False)
-    
+
     # Configuration info (avoid exposing partial API key)
     embed.add_field(name="URL", value=os.getenv('CRCON_URL', 'Not set'), inline=True)
     embed.add_field(name="API Key", value="✅ Configured" if os.getenv('CRCON_API_KEY') else '❌ Not set', inline=True)
-    
+
     await interaction.followup.send(embed=embed)
 
 
-    @bot.tree.command(name="killfeed_status", description="Show CRCON kill feed listener health")
-    async def killfeed_status(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+@bot.tree.command(name="killfeed_status", description="Show CRCON kill feed listener health")
+async def killfeed_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
 
-        embed = discord.Embed(title="💥 Kill Feed Status", color=0x3498db)
-        feature_state = "🟢 ENABLE_KILL_FEED=true" if ENABLE_KILL_FEED else "🔴 ENABLE_KILL_FEED=false"
-        embed.add_field(name="Feature", value=feature_state, inline=False)
+    embed = discord.Embed(title="💥 Kill Feed Status", color=0x3498db)
+    feature_state = "🟢 ENABLE_KILL_FEED=true" if ENABLE_KILL_FEED else "🔴 ENABLE_KILL_FEED=false"
+    embed.add_field(name="Feature", value=feature_state, inline=False)
 
-        if not ENABLE_KILL_FEED:
-            embed.add_field(
-                name="Next Steps",
-                value="Set ENABLE_KILL_FEED=true in your environment to start tracking tank kills.",
-                inline=False
-            )
-            return await interaction.followup.send(embed=embed, ephemeral=True)
+    if not ENABLE_KILL_FEED:
+        embed.add_field(
+            name="Next Steps",
+            value="Set ENABLE_KILL_FEED=true in your environment to start tracking tank kills.",
+            inline=False
+        )
+        return await interaction.followup.send(embed=embed, ephemeral=True)
 
-        listener = kill_feed_listener
-        if not listener:
-            embed.add_field(
-                name="Listener",
-                value="⚪ Not started (run /reverse_clock and start a match to attach)",
-                inline=False
-            )
+    listener = kill_feed_listener
+    if not listener:
+        embed.add_field(
+            name="Listener",
+            value="⚪ Not started (run /reverse_clock and start a match to attach)",
+            inline=False
+        )
+    else:
+        running = "🟢 Running" if listener.is_running else "🔴 Stopped"
+        connected = "🟢 Connected" if listener.is_connected else "🟡 Connecting"
+        queue_size = listener.get_queue().qsize()
+        embed.add_field(
+            name="Listener",
+            value=f"{running}\n{connected}\nQueue: {queue_size}/1000",
+            inline=False
+        )
+
+    channel_value = "None"
+    if active_kill_feed_channel_id is not None:
+        channel_obj = bot.get_channel(active_kill_feed_channel_id)
+        if hasattr(channel_obj, 'name'):
+            prefix = f"#{channel_obj.name}"
+            if getattr(channel_obj, 'guild', None):
+                prefix = f"{channel_obj.guild.name} {prefix}"
+            channel_value = f"{prefix} ({active_kill_feed_channel_id})"
         else:
-            running = "🟢 Running" if listener.is_running else "🔴 Stopped"
-            connected = "🟢 Connected" if listener.is_connected else "🟡 Connecting"
-            queue_size = listener.get_queue().qsize()
-            embed.add_field(
-                name="Listener",
-                value=f"{running}\n{connected}\nQueue: {queue_size}/1000",
-                inline=False
-            )
+            channel_value = str(active_kill_feed_channel_id)
+    embed.add_field(name="Active Match Channel", value=channel_value, inline=False)
 
-        channel_value = "None"
-        if active_kill_feed_channel_id is not None:
-            channel_obj = bot.get_channel(active_kill_feed_channel_id)
-            if hasattr(channel_obj, 'name'):
-                prefix = f"#{channel_obj.name}"
-                if getattr(channel_obj, 'guild', None):
-                    prefix = f"{channel_obj.guild.name} {prefix}"
-                channel_value = f"{prefix} ({active_kill_feed_channel_id})"
-            else:
-                channel_value = str(active_kill_feed_channel_id)
-        embed.add_field(name="Active Match Channel", value=channel_value, inline=False)
+    if CRCON_WS_TOKEN:
+        token_status = "Custom value" if RAW_CRCON_WS_TOKEN else "Using CRCON_API_KEY"
+    else:
+        token_status = "Missing"
 
-        if CRCON_WS_TOKEN:
-            token_status = "Custom value" if RAW_CRCON_WS_TOKEN else "Using CRCON_API_KEY"
-        else:
-            token_status = "Missing"
+    config_lines = [
+        f"WS URL: {CRCON_WS_URL or 'Not set'}",
+        f"WS Token: {token_status}",
+    ]
+    embed.add_field(name="Configuration", value="\n".join(config_lines), inline=False)
 
-        config_lines = [
-            f"WS URL: {CRCON_WS_URL or 'Not set'}",
-            f"WS Token: {token_status}",
-        ]
-        embed.add_field(name="Configuration", value="\n".join(config_lines), inline=False)
+    if last_kill_feed_event:
+        raw_preview = (
+            last_kill_feed_event.raw
+            if isinstance(last_kill_feed_event.raw, str)
+            else ''
+        )
+        if not raw_preview:
+            try:
+                raw_preview = (
+                    json.dumps(last_kill_feed_event.payload)
+                    if last_kill_feed_event.payload is not None
+                    else "<no payload>"
+                )
+            except TypeError:
+                raw_preview = str(last_kill_feed_event.payload)
+        preview = _shorten_text(raw_preview)
+        embed.add_field(
+            name="Last Event",
+            value=f"{_format_relative_time(last_kill_feed_event.received_at)} ago\n{preview}",
+            inline=False
+        )
+    else:
+        embed.add_field(name="Last Event", value="No kill feed events received yet.", inline=False)
 
-        if last_kill_feed_event:
-            raw_preview = last_kill_feed_event.raw if isinstance(last_kill_feed_event.raw, str) else ''
-            if not raw_preview:
-                try:
-                    raw_preview = json.dumps(last_kill_feed_event.payload) if last_kill_feed_event.payload is not None else "<no payload>"
-                except TypeError:
-                    raw_preview = str(last_kill_feed_event.payload)
-            preview = _shorten_text(raw_preview)
-            embed.add_field(
-                name="Last Event",
-                value=f"{_format_relative_time(last_kill_feed_event.received_at)} ago\n{preview}",
-                inline=False
-            )
-        else:
-            embed.add_field(name="Last Event", value="No kill feed events received yet.", inline=False)
+    if last_tank_kill_detection:
+        detection = last_tank_kill_detection
+        detection_time = (
+            last_tank_kill_event.received_at
+            if last_tank_kill_event
+            else datetime.datetime.now(timezone.utc)
+        )
+        detail = detection.keyword_match or detection.vehicle or detection.weapon
+        detection_summary = (
+            f"{detection.killer_name} ({detection.killer_team}) → {detection.victim_name} ({detection.victim_team})"
+            f" with {detail}"
+        )
+        embed.add_field(
+            name="Last Tank Kill",
+            value=f"{_format_relative_time(detection_time)} ago\n{detection_summary}",
+            inline=False
+        )
+    else:
+        embed.add_field(name="Last Tank Kill", value="No tank kills detected yet.", inline=False)
 
-        if last_tank_kill_detection:
-            detection = last_tank_kill_detection
-            detection_time = last_tank_kill_event.received_at if last_tank_kill_event else datetime.datetime.now(timezone.utc)
-            detail = detection.keyword_match or detection.vehicle or detection.weapon
-            detection_summary = (
-                f"{detection.killer_name} ({detection.killer_team}) → {detection.victim_name} ({detection.victim_team})"
-                f" with {detail}"
-            )
-            embed.add_field(
-                name="Last Tank Kill",
-                value=f"{_format_relative_time(detection_time)} ago\n{detection_summary}",
-                inline=False
-            )
-        else:
-            embed.add_field(name="Last Tank Kill", value="No tank kills detected yet.", inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="server_info", description="Get current HLL server information")
 async def server_info(interaction: discord.Interaction):
@@ -2049,13 +2315,18 @@ async def server_info(interaction: discord.Interaction):
                     time_remaining = result.get('time_remaining', 0)
 
             if time_remaining > 0:
-                embed.add_field(name="⏱️ Game Time", value=f"{time_remaining//60}:{time_remaining%60:02d}", inline=True)
-            
+                embed.add_field(
+                    name="⏱️ Game Time",
+                    value=f"{time_remaining // 60}:{time_remaining % 60:02d}",
+                    inline=True,
+                )
+
             embed.timestamp = datetime.datetime.now(timezone.utc)
             await interaction.followup.send(embed=embed)
-            
+
     except Exception as e:
         await interaction.followup.send(f"❌ Error retrieving server info: {str(e)}")
+
 
 @bot.tree.command(name="test_map", description="Debug game state and player count")
 async def test_map(interaction: discord.Interaction):
@@ -2104,6 +2375,7 @@ async def test_map(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
+
 @bot.tree.command(name="test_player_scores", description="Test if CRCON provides player combat scores")
 async def test_player_scores(interaction: discord.Interaction):
     """Test command to see what player stats CRCON provides"""
@@ -2143,6 +2415,7 @@ async def test_player_scores(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
+
 @bot.tree.command(name="send_message", description="Send a message to the HLL server")
 async def send_server_message(interaction: discord.Interaction, message: str):
     if not user_is_admin(interaction):
@@ -2161,7 +2434,7 @@ async def send_server_message(interaction: discord.Interaction, message: str):
         test_client = APIKeyCRCONClient()
         async with test_client as client:
             success = await client.send_message(f"📢 [Discord] {message}")
-            
+
             if success:
                 embed = discord.Embed(
                     title="📢 Message Sent",
@@ -2174,11 +2447,12 @@ async def send_server_message(interaction: discord.Interaction, message: str):
                     description="Message endpoints not available on this CRCON version",
                     color=0xffaa00
                 )
-            
+
             await interaction.followup.send(embed=embed, ephemeral=True)
-            
+
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
 
 @bot.tree.command(name="set_team_names", description="Set custom team names for the match")
 async def set_team_names_cmd(interaction: discord.Interaction, team_a: str = "Allies", team_b: str = "Axis"):
@@ -2188,7 +2462,10 @@ async def set_team_names_cmd(interaction: discord.Interaction, team_a: str = "Al
 
     channel_id = interaction.channel_id
     if channel_id not in clocks:
-        return await interaction.response.send_message("❌ No active clock in this channel. Use /reverse_clock first.", ephemeral=True)
+        return await interaction.response.send_message(
+            "❌ No active clock in this channel. Use /reverse_clock first.",
+            ephemeral=True
+        )
 
     clock = clocks[channel_id]
     clock.team_names['allied'] = team_a
@@ -2198,9 +2475,18 @@ async def set_team_names_cmd(interaction: discord.Interaction, team_a: str = "Al
     embed.add_field(name="Allied Team", value=team_a, inline=True)
     embed.add_field(name="Axis Team", value=team_b, inline=True)
     embed.add_field(name="Scoring", value="DMT Total Score (Always Active)", inline=False)
-    embed.add_field(name="Formula", value="Combat: 3×(Crew1+Crew2+Crew3+Crew4) + Commander\nCap: Seconds × 0.5\nTotal DMT: Combat + Cap", inline=False)
+    embed.add_field(
+        name="Formula",
+        value=(
+            "Combat: 3×(Crew1+Crew2+Crew3+Crew4) + Commander\n"
+            "Cap: Seconds × 0.5\n"
+            "Total DMT: Combat + Cap"
+        ),
+        inline=False
+    )
 
     await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="set_crew_squads", description="Configure which squads represent which crews")
 async def set_crew_squads(
@@ -2240,6 +2526,7 @@ async def set_crew_squads(
     embed.add_field(name="Commander", value=commander, inline=True)
 
     await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="dmt_scores", description="Show current DMT scores")
 async def dmt_scores(interaction: discord.Interaction):
@@ -2301,10 +2588,11 @@ async def dmt_scores(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed)
 
+
 @bot.tree.command(name="help_clock", description="Show help for the time control clock")
 async def help_clock(interaction: discord.Interaction):
     embed = discord.Embed(title="🎯 HLL Tank Overwatch Clock Help", color=0x0099ff)
-    
+
     embed.add_field(
         name="📋 Commands",
         value=(
@@ -2316,7 +2604,7 @@ async def help_clock(interaction: discord.Interaction):
         ),
         inline=False
     )
-    
+
     embed.add_field(
         name="🎮 How to Use",
         value=(
@@ -2328,7 +2616,7 @@ async def help_clock(interaction: discord.Interaction):
         ),
         inline=False
     )
-    
+
     embed.add_field(
         name="🏆 How to Win",
         value=(
@@ -2339,7 +2627,7 @@ async def help_clock(interaction: discord.Interaction):
         ),
         inline=False
     )
-    
+
     embed.add_field(
         name="⚙️ Auto-Switch",
         value=(
@@ -2348,19 +2636,22 @@ async def help_clock(interaction: discord.Interaction):
         ),
         inline=False
     )
-    
+
     embed.add_field(
         name="👑 Admin Requirements",
         value="You need the **Admin** role to control the clock.",
         inline=False
     )
-    
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # Error handling
+
+
 @bot.event
 async def on_error(event, *args, **kwargs):
     logger.error(f"Bot error in {event}: {args}")
+
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
@@ -2375,11 +2666,12 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
     except Exception as e:
         logger.error(f"Unexpected error sending error message: {e}")
 
+
 @bot.event
 async def on_ready():
     logger.info(f"✅ Bot logged in as {bot.user}")
     logger.info(f"🔗 CRCON URL: {os.getenv('CRCON_URL', 'Not configured')}")
-    
+
     # Test CRCON connection on startup
     try:
         test_client = APIKeyCRCONClient()
@@ -2391,7 +2683,7 @@ async def on_ready():
                 logger.warning("🟡 CRCON connected but no game data")
     except Exception as e:
         logger.warning(f"⚠️ CRCON connection test failed: {e}")
-    
+
     if ENABLE_KILL_FEED:
         ensure_kill_feed_listener()
 
@@ -2400,7 +2692,7 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         logger.info(f"✅ Synced {len(synced)} slash commands")
-        print(f"🎉 HLL Tank Overwatch Clock ready! Use /reverse_clock to start")
+        print("🎉 HLL Tank Overwatch Clock ready! Use /reverse_clock to start")
     except Exception as e:
         logger.error(f"❌ Command sync failed: {e}")
 
@@ -2408,7 +2700,7 @@ async def on_ready():
 if __name__ == "__main__":
     print("🚀 Starting HLL Tank Overwatch Bot...")
     print("📝 Version: Updated with corrected CRCON endpoints")
-    
+
     # Check for Discord token
     token = os.getenv("DISCORD_TOKEN")
     if not token or token == "your_discord_bot_token_here":
@@ -2417,14 +2709,14 @@ if __name__ == "__main__":
         print("2. Copy the bot token")
         print("3. Edit .env file and set DISCORD_TOKEN=your_actual_token")
         exit(1)
-    
+
     # Check for API key
     api_key = os.getenv("CRCON_API_KEY")
     if not api_key or api_key == "your_crcon_api_key_here":
         print("❌ CRCON_API_KEY not configured!")
         print("Edit .env file and set CRCON_API_KEY=your_crcon_api_key_here")
         exit(1)
-    
+
     # Validate CRCON URL
     crcon_url = os.getenv('CRCON_URL', 'http://localhost:8010')
     if not crcon_url.startswith(('http://', 'https://')):
@@ -2462,16 +2754,16 @@ if __name__ == "__main__":
         print(f"   Tank Keywords: {keyword_total} entries ({TANK_KEYWORD_SOURCE})")
     else:
         print("💥 Kill Feed: Disabled")
-    
+
     log_channel = os.getenv('LOG_CHANNEL_ID', '0')
     if log_channel != '0':
         print(f"📋 Log Channel: {log_channel}")
     else:
         print("📋 Log Channel: Disabled")
-    
+
     print("🎯 Focus: TIME CONTROL - Win by holding the center point longest!")
     print("✅ Endpoint Update: Fixed get_player_ids endpoint")
-    
+
     try:
         bot.run(token)
     except Exception as e:
