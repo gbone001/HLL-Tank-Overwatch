@@ -41,6 +41,10 @@
 | `BOT_NAME` | `HLLTankBot` | Name shown in game messages |
 | `BOT_AUTHOR` | `StoneyRebel` | Author shown in embed footer |
 | `LOG_CHANNEL_ID` | `0` | Discord channel for match logs (0 = disabled) |
+| `ENABLE_KILL_FEED` | `false` | Enable experimental tank-kill tracking |
+| `CRCON_WS_URL` | `ws://localhost:8010/ws/logs` | CRCON WebSocket endpoint (required when kill feed is enabled) |
+| `CRCON_WS_TOKEN` | `CRCON_API_KEY` | Bearer token for the CRCON WebSocket log stream (leave blank to reuse the API key) |
+| `TANK_WEAPON_KEYWORDS` | – | JSON string or file path listing weapon keywords that count as tank kills |
 
 ## Discord Setup
 
@@ -91,6 +95,22 @@
 3. **View stats:**
    - Click "📊 Stats" for live match statistics
    - Use `/server_info` for current server information
+   - Run `/killfeed_status` to check kill feed health when tank tracking is enabled
+
+## Local Kill Feed Mock
+
+For manual testing without a live CRCON feed:
+
+1. Install the dev dependency once:
+   ```bash
+   npm install ws
+   ```
+2. Start the helper:
+   ```bash
+   node tools/mock_kill_feed_server.js --port 8765 --token local-dev
+   ```
+3. Set `.env` to point at the mock (`ENABLE_KILL_FEED=true`, `CRCON_WS_URL=ws://localhost:8765`, `CRCON_WS_TOKEN=local-dev` or leave blank to reuse `CRCON_API_KEY`).
+4. Run the bot, start a match, then tap **ENTER** in the mock terminal to stream canned tank kills (or pipe custom JSON) and watch the Discord embed update.
 
 ## Troubleshooting
 
@@ -98,6 +118,7 @@
 - **No admin permissions:** Make sure you have the role specified in `ADMIN_ROLE_NAME`
 - **CRCON not connecting:** Verify `CRCON_URL` and `CRCON_API_KEY` are correct
 - **Auto-switch not working:** Enable `CRCON_AUTO_SWITCH=true` and ensure CRCON connection is stable
+- **Kill feed idle:** Confirm `ENABLE_KILL_FEED=true`, CRCON WebSocket settings are valid, and inspect `/killfeed_status` for listener/connection details
 
 ## Support
 
