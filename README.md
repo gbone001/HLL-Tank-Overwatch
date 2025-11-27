@@ -130,12 +130,14 @@ The bot creates interactive Discord embeds showing:
 | `BOT_NAME` | `HLLTankBot` | Name shown in game messages |
 | `BOT_AUTHOR` | `YourCommunityName` | Author shown in embed footer |
 | `LOG_CHANNEL_ID` | `0` | Discord channel for match logs (0 = disabled) |
-| `ENABLE_KILL_FEED` | `false` | Toggle experimental tank-kill tracking via CRCON WebSocket |
-| `CRCON_WS_URL` | `ws://localhost:8010/ws/logs` | CRCON WebSocket endpoint (required when kill feed is enabled) |
-| `CRCON_WS_TOKEN` | `CRCON_API_KEY` | Bearer token for the CRCON WebSocket log stream (leave blank to reuse the API key) |
-| `CRCON_WS_HEARTBEAT` | `30` | WebSocket ping interval in seconds (set to `0` to disable heartbeat pings) |
-| `CRCON_WS_VERIFY_SSL` | `true` | Verify TLS certificates for the WebSocket (`false` helps with self-signed certs) |
+| `ENABLE_KILL_FEED` | `false` | Toggle tank-kill tracking via CRCON webhook |
+| `KILL_WEBHOOK_PORT` | `8081` | Port to listen for CRCON kill webhooks |
+| `KILL_WEBHOOK_HOST` | `0.0.0.0` | Host/interface to bind the webhook listener |
+| `KILL_WEBHOOK_PATH` | `/kill-webhook` | Path for the webhook POST endpoint |
+| `KILL_WEBHOOK_SECRET` | – | Optional shared secret expected in `X-Webhook-Secret` header |
 | `TANK_WEAPON_KEYWORDS` | – | JSON string or file path listing weapon keywords that count as tank kills |
+
+> Note: Previous WebSocket/polling kill feed integration was removed in favor of the CRCON kill webhook; keep these settings handy only if you reintroduce the older transport in the future.
 
 ## 🎮 Discord Setup
 

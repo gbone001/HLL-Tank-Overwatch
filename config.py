@@ -32,18 +32,6 @@ def enable_kill_feed(default: bool = False) -> bool:
     return _get_bool("ENABLE_KILL_FEED", default)
 
 
-def crcon_ws_url(default: str = "wss://localhost:8010/ws/logs") -> str:
-    # Prefer secure websocket by default for remote servers.
-    return os.getenv("CRCON_WS_URL", default).strip()
-
-
-def crcon_ws_token() -> str:
-    raw = (os.getenv("CRCON_WS_TOKEN") or "").strip()
-    if raw:
-        return raw
-    return crcon_api_key()
-
-
 def crcon_timeout(default: int = 15) -> int:
     return _get_int("CRCON_TIMEOUT", default)
 
@@ -52,11 +40,42 @@ def tanks_file(default: str = "tanks.json") -> str:
     return os.getenv("TANKS_FILE", default).strip()
 
 
-def crcon_ws_heartbeat(default: int = 30) -> int:
-    """Heartbeat interval (seconds) for the CRCON WebSocket; 0 disables pings."""
-    return _get_int("CRCON_WS_HEARTBEAT", default)
+def kill_webhook_port(default: int = 8081) -> int:
+    raw = os.getenv("KILL_WEBHOOK_PORT")
+    fallback_port = os.getenv("PORT")
+
+    def _parse(val: str) -> int | None:
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return None
+
+    # Handle common placeholder usage KILL_WEBHOOK_PORT=$PORT
+    if raw:
+        if raw.strip() == "$PORT" and fallback_port:
+            parsed = _parse(fallback_port)
+            if parsed:
+                return parsed
+        parsed = _parse(raw)
+        if parsed:
+            return parsed
+
+    if fallback_port:
+        parsed = _parse(fallback_port)
+        if parsed:
+            return parsed
+
+    return default
 
 
-def crcon_ws_verify_ssl(default: bool = True) -> bool:
-    """Whether to verify TLS certificates for the CRCON WebSocket."""
-    return _get_bool("CRCON_WS_VERIFY_SSL", default)
+def kill_webhook_host(default: str = "0.0.0.0") -> str:
+    return os.getenv("KILL_WEBHOOK_HOST", default).strip()
+
+
+def kill_webhook_path(default: str = "/kill-webhook") -> str:
+    value = os.getenv("KILL_WEBHOOK_PATH", default).strip()
+    return value if value.startswith("/") else f"/{value}"
+
+
+def kill_webhook_secret(default: str = "") -> str:
+    return os.getenv("KILL_WEBHOOK_SECRET", default).strip()

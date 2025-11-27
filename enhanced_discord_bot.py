@@ -17,7 +17,6 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
 from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from datetime import timezone
@@ -49,20 +48,19 @@ from config import (
     crcon_api_key,
     crcon_timeout,
     crcon_url,
-    crcon_ws_heartbeat,
-    crcon_ws_token,
-    crcon_ws_verify_ssl,
-    crcon_ws_url,
     enable_kill_feed,
+    kill_webhook_host,
+    kill_webhook_path,
+    kill_webhook_port,
+    kill_webhook_secret,
     tanks_file,
 )
 
 ENABLE_KILL_FEED = enable_kill_feed()
-CRCON_WS_URL = crcon_ws_url()
-RAW_CRCON_WS_TOKEN = (os.getenv('CRCON_WS_TOKEN') or '').strip()
-CRCON_WS_TOKEN = crcon_ws_token()
-CRCON_WS_HEARTBEAT = crcon_ws_heartbeat()
-CRCON_WS_VERIFY_SSL = crcon_ws_verify_ssl()
+WEBHOOK_PORT = kill_webhook_port()
+WEBHOOK_HOST = kill_webhook_host()
+WEBHOOK_PATH = kill_webhook_path()
+WEBHOOK_SECRET = kill_webhook_secret()
 TANK_EVENT_HISTORY_LIMIT = 25
 DEFAULT_TANK_WEAPON_KEYWORDS: Dict[str, List[str]] = {
     "cannon_shells": [
@@ -583,33 +581,26 @@ def detect_tank_kill(
     )
 
 
-class KillFeedListener:
-    """Consumes the CRCON WebSocket kill feed and fans out events."""
+class KillWebhookServer:
+    """Receives kill webhooks and feeds them into the kill detection pipeline."""
 
     def __init__(
         self,
-        url: str,
-        token: str,
-        backoff_base: int = 5,
-        backoff_max: int = 60,
-        auth_fail_limit: int = 3,
-        heartbeat: int = 30,
-        verify_ssl: bool = True,
+        host: str,
+        port: int,
+        path: str,
+        secret: str = "",
     ):
-        self.url = url
-        self.token = token or ""
+        self.host = host
+        self.port = port
+        self.path = path
+        self.secret = secret or ""
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._runner: Optional[aiohttp.web.AppRunner] = None
+        self._site: Optional[aiohttp.web.TCPSite] = None
         self._task: Optional[asyncio.Task] = None
-        self._stop_event = asyncio.Event()
-        self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-        self._callbacks: List[KillFeedCallback] = []
         self._connected = asyncio.Event()
-        self._backoff_base = backoff_base
-        self._backoff_max = backoff_max
-        self._auth_fail_limit = auth_fail_limit
-        self._auth_failures = 0
-        self.disabled_reason: Optional[str] = None
-        self._heartbeat = max(0, heartbeat)
-        self._verify_ssl = verify_ssl
+        self.last_event: Optional[KillFeedEvent] = None
 
     @property
     def is_running(self) -> bool:
@@ -622,14 +613,9 @@ class KillFeedListener:
     def start(self):
         if self.is_running:
             return
-        if self.disabled_reason:
-            logger.warning("Kill feed listener not started: %s", self.disabled_reason)
-            return
-        self._stop_event.clear()
-        self._task = asyncio.create_task(self._run(), name="crcon-kill-feed")
+        self._task = asyncio.create_task(self._run(), name="crcon-kill-webhook")
 
     async def stop(self):
-        self._stop_event.set()
         if self._task:
             self._task.cancel()
             try:
@@ -638,228 +624,63 @@ class KillFeedListener:
                 pass
         self._task = None
 
-    def subscribe(self, callback: KillFeedCallback):
-        if callback not in self._callbacks:
-            self._callbacks.append(callback)
-
-    def unsubscribe(self, callback: KillFeedCallback):
-        if callback in self._callbacks:
-            self._callbacks.remove(callback)
-
     def get_queue(self) -> asyncio.Queue:
-        return self._event_queue
-
-    async def wait_until_connected(self, timeout: Optional[float] = None) -> bool:
-        try:
-            await asyncio.wait_for(self._connected.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
+        return self._queue
 
     async def _run(self):
-        backoff = self._backoff_base
-        while not self._stop_event.is_set():
-            try:
-                ssl_context = None if self._verify_ssl else False
-                heartbeat = self._heartbeat or None
-                headers = {}
-                if self.token:
-                    headers['Authorization'] = f'Bearer {self.token}'
-                async with aiohttp.ClientSession(headers=headers) as session:
-                    safe_url = _sanitize_ws_url(self.url)
-                    logger.info(
-                        "Connecting to CRCON kill feed at %s",
-                        safe_url,
-                    )
-                    async with session.ws_connect(
-                        self.url,
-                        heartbeat=heartbeat,
-                        ssl=ssl_context,
-                    ) as ws:
-                        logger.info("Kill feed connected")
-                        # Send subscription filter so CRCON knows which actions we want
-                        try:
-                            await ws.send_json({
-                                "last_seen_id": None,
-                                "actions": ["KILL"],
-                            })
-                        except Exception as sub_err:
-                            logger.warning("Failed to send kill feed subscription: %s", sub_err)
-                        self._connected.set()
-                        self._auth_failures = 0
-                        backoff = self._backoff_base
-                        async for msg in ws:
-                            if self._stop_event.is_set():
-                                break
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                event = self._build_event(msg.data)
-                                if isinstance(event.payload, dict) and event.payload.get("error"):
-                                    error_msg = str(event.payload.get("error"))
-                                    self.disabled_reason = f"CRCON stream error: {error_msg}"
-                                    logger.error(
-                                        "Kill feed disabled by server: %s",
-                                        error_msg,
-                                    )
-                                    await ws.close(code=1000)
-                                    self._stop_event.set()
-                                    break
-                                if self._should_accept_event(event):
-                                    await self._dispatch(event)
-                            elif msg.type == aiohttp.WSMsgType.CLOSING:
-                                logger.warning(
-                                    "Kill feed websocket closing: code=%s message=%s",
-                                    ws.close_code,
-                                    _format_ws_close_reason(
-                                        getattr(ws, "close_message", None)
-                                        or getattr(ws, "close_reason", None)
-                                    ),
-                                )
-                                break
-                            elif msg.type in (
-                                aiohttp.WSMsgType.ERROR,
-                                aiohttp.WSMsgType.CLOSED,
-                                aiohttp.WSMsgType.CLOSE,
-                            ):
-                                logger.warning(
-                                    "Kill feed websocket closed (%s): code=%s message=%s",
-                                    msg.type.name,
-                                    ws.close_code,
-                                    _format_ws_close_reason(
-                                        getattr(ws, "close_message", None)
-                                        or getattr(ws, "close_reason", None)
-                                    ),
-                                )
-                                break
-                        if not ws.closed:
-                            await ws.close()
-                        logger.warning(
-                            "Kill feed websocket ended: code=%s message=%s",
-                            ws.close_code,
-                            _format_ws_close_reason(
-                                getattr(ws, "close_message", None)
-                                or getattr(ws, "close_reason", None)
-                            ),
-                        )
-                self._connected.clear()
-                if self._stop_event.is_set():
-                    break
-                logger.warning(
-                    "Kill feed disconnected, retrying in %ss",
-                    backoff,
-                )
-                await self._sleep_with_jitter(backoff)
-                backoff = min(backoff * 2, self._backoff_max)
-            except asyncio.CancelledError:
-                break
-            except aiohttp.ClientConnectorCertificateError as e:
-                self._connected.clear()
-                logger.error(
-                    "Kill feed TLS verification failed for %s: %s. "
-                    "Set CRCON_WS_VERIFY_SSL=false only if you trust the server certificate.",
-                    _sanitize_ws_url(self.url),
-                    e,
-                )
-                self.disabled_reason = "TLS verification failed (see logs)"
-                self._stop_event.set()
-                break
-            except aiohttp.WSServerHandshakeError as e:
-                self._connected.clear()
-                logger.warning(
-                    "Kill feed handshake failed (%s): %s",
-                    getattr(e, "status", "unknown status"),
-                    e,
-                )
-                await self._sleep_with_jitter(backoff)
-                backoff = min(backoff * 2, self._backoff_max)
-            except aiohttp.ClientResponseError as e:
-                self._connected.clear()
-                if self._stop_event.is_set():
-                    break
-                status = getattr(e, "status", None)
-                if status in (401, 403):
-                    self._auth_failures += 1
-                    logger.warning(
-                        "Kill feed auth error %s (attempt %s/%s).",
-                        status,
-                        self._auth_failures,
-                        self._auth_fail_limit,
-                    )
-                    if self._auth_failures >= self._auth_fail_limit:
-                        self.disabled_reason = f"Authentication failed ({status}) - check CRCON_WS_TOKEN"
-                        logger.error("Kill feed disabled: %s", self.disabled_reason)
-                        self._stop_event.set()
-                        break
-                else:
-                    logger.warning(
-                        "Kill feed HTTP error%s: %s. Retrying in %ss",
-                        f" {status}" if status is not None else "",
-                        e.message if hasattr(e, "message") else e,
-                        backoff,
-                    )
-                await self._sleep_with_jitter(backoff)
-                backoff = min(backoff * 2, self._backoff_max)
-            except Exception as e:
-                self._connected.clear()
-                if self._stop_event.is_set():
-                    break
-                logger.warning(
-                    "Kill feed transient error (%s): %s",
-                    e.__class__.__name__,
-                    e,
-                )
-                await self._sleep_with_jitter(backoff)
-                backoff = min(backoff * 2, self._backoff_max)
-
-        logger.info("Kill feed listener stopped")
-
-    async def _sleep_with_jitter(self, backoff: float):
-        jitter = backoff * 0.3
-        await asyncio.sleep(backoff + random.uniform(0, jitter))
-
-    def _should_accept_event(self, event: KillFeedEvent) -> bool:
-        if event.payload is None:
-            logger.debug("Kill feed ignored empty payload")
-            return False
-        if isinstance(event.payload, str) and not event.payload.strip():
-            logger.debug("Kill feed ignored blank payload")
-            return False
-        return True
-
-    def _build_event(self, raw_data: str) -> KillFeedEvent:
-        payload: Any = None
-        cleaned = raw_data.strip() if raw_data else ""
-        if cleaned:
-            try:
-                payload = json.loads(cleaned)
-            except json.JSONDecodeError:
-                payload = cleaned
-
-        return KillFeedEvent(
-            raw=raw_data,
-            payload=payload,
-            received_at=datetime.datetime.now(timezone.utc)
+        app = aiohttp.web.Application()
+        app.router.add_post(self.path, self._handle_webhook)
+        self._runner = aiohttp.web.AppRunner(app)
+        await self._runner.setup()
+        self._site = aiohttp.web.TCPSite(self._runner, self.host, self.port)
+        await self._site.start()
+        self._connected.set()
+        logger.info(
+            "Kill webhook listening on http://%s:%s%s",
+            self.host,
+            self.port,
+            self.path,
         )
-
-    async def _dispatch(self, event: KillFeedEvent):
         try:
-            self._event_queue.put_nowait(event)
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._connected.clear()
+            if self._runner:
+                await self._runner.cleanup()
+            logger.info("Kill webhook listener stopped")
+
+    async def _handle_webhook(self, request: aiohttp.web.Request):
+        if self.secret:
+            provided = request.headers.get("X-Webhook-Secret", "")
+            if provided != self.secret:
+                return aiohttp.web.json_response({"status": "forbidden"}, status=403)
+        try:
+            payload = await request.json()
+        except Exception:
+            return aiohttp.web.json_response({"status": "bad json"}, status=400)
+
+        event = KillFeedEvent(
+            raw=payload,
+            payload=payload,
+            received_at=datetime.datetime.now(timezone.utc),
+        )
+        self.last_event = event
+        try:
+            self._queue.put_nowait(event)
         except asyncio.QueueFull:
             try:
-                _ = self._event_queue.get_nowait()
+                _ = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
-            self._event_queue.put_nowait(event)
+            self._queue.put_nowait(event)
 
-        for callback in list(self._callbacks):
-            try:
-                result = callback(event)
-                if inspect.isawaitable(result):
-                    await result
-            except Exception as e:
-                logger.exception(f"Kill feed callback error: {e}")
+        return aiohttp.web.json_response({"status": "ok"})
 
 
-kill_feed_listener: Optional[KillFeedListener] = None
+kill_webhook_server: Optional[KillWebhookServer] = None
 kill_feed_consumer_task: Optional[asyncio.Task] = None
 active_kill_feed_channel_id: Optional[int] = None
 last_kill_feed_event: Optional[KillFeedEvent] = None
@@ -869,23 +690,23 @@ last_tank_kill_event: Optional[KillFeedEvent] = None
 
 def ensure_kill_feed_listener():
     """Start the kill feed listener if the feature is enabled."""
-    global kill_feed_listener, kill_feed_consumer_task
+    global kill_webhook_server, kill_feed_consumer_task
     if not ENABLE_KILL_FEED:
         logger.debug("Kill feed listener skipped (ENABLE_KILL_FEED=false)")
         return
 
-    if not kill_feed_listener:
-        logger.info("Initializing kill feed listener for %s", _sanitize_ws_url(CRCON_WS_URL))
-        kill_feed_listener = KillFeedListener(
-            CRCON_WS_URL,
-            CRCON_WS_TOKEN or "",
-            heartbeat=CRCON_WS_HEARTBEAT,
-            verify_ssl=CRCON_WS_VERIFY_SSL,
+    if not kill_webhook_server:
+        logger.info("Initializing kill webhook listener on %s:%s%s", WEBHOOK_HOST, WEBHOOK_PORT, WEBHOOK_PATH)
+        kill_webhook_server = KillWebhookServer(
+            host=WEBHOOK_HOST,
+            port=WEBHOOK_PORT,
+            path=WEBHOOK_PATH,
+            secret=WEBHOOK_SECRET,
         )
 
-    if not kill_feed_listener.is_running:
-        logger.info("Starting CRCON kill feed listener task")
-        kill_feed_listener.start()
+    if not kill_webhook_server.is_running:
+        logger.info("Starting kill webhook listener task")
+        kill_webhook_server.start()
 
     if not kill_feed_consumer_task or kill_feed_consumer_task.done():
         logger.info("Starting tank kill detection loop")
@@ -893,10 +714,10 @@ def ensure_kill_feed_listener():
 
 
 async def _kill_feed_detection_loop():
-    if not kill_feed_listener:
+    if not kill_webhook_server:
         return
 
-    queue = kill_feed_listener.get_queue()
+    queue = kill_webhook_server.get_queue()
     while True:
         try:
             event: KillFeedEvent = await queue.get()
@@ -979,27 +800,6 @@ def _get_target_clocks() -> List['ClockState']:
     if clock:
         return [clock]
     return [c for c in clocks.values() if c.started]
-
-
-def _format_ws_close_reason(reason: Any) -> str:
-    if reason is None:
-        return ""
-    if isinstance(reason, bytes):
-        try:
-            return reason.decode("utf-8", errors="ignore")
-        except Exception:
-            return repr(reason)
-    return str(reason)
-
-
-def _sanitize_ws_url(url: str) -> str:
-    if not url:
-        return ""
-    try:
-        parts = urlsplit(url)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, '', ''))
-    except Exception:
-        return url
 
 
 def _format_relative_time(moment: datetime.datetime) -> str:
@@ -2401,7 +2201,7 @@ async def killfeed_status(interaction: discord.Interaction):
         )
         return await interaction.followup.send(embed=embed, ephemeral=True)
 
-    listener = kill_feed_listener
+    listener = kill_webhook_server
     if not listener:
         embed.add_field(
             name="Listener",
@@ -2410,19 +2210,13 @@ async def killfeed_status(interaction: discord.Interaction):
         )
     else:
         running = "🟢 Running" if listener.is_running else "🔴 Stopped"
-        connected = "🟢 Connected" if listener.is_connected else "🟡 Connecting"
+        connected = "🟢 Connected" if listener.is_connected else "🟡 Starting"
         queue_size = listener.get_queue().qsize()
         embed.add_field(
             name="Listener",
-            value=f"{running}\n{connected}\nQueue: {queue_size}/1000",
+            value=f"Webhook\n{running}\n{connected}\nQueue: {queue_size}/1000",
             inline=False
         )
-        if listener.disabled_reason:
-            embed.add_field(
-                name="Status",
-                value=f"🔴 Disabled: {listener.disabled_reason}",
-                inline=False
-            )
 
     channel_value = "None"
     if active_kill_feed_channel_id is not None:
@@ -2436,16 +2230,9 @@ async def killfeed_status(interaction: discord.Interaction):
             channel_value = str(active_kill_feed_channel_id)
     embed.add_field(name="Active Match Channel", value=channel_value, inline=False)
 
-    if CRCON_WS_TOKEN:
-        token_status = "Custom value" if RAW_CRCON_WS_TOKEN else "Using CRCON_API_KEY"
-    else:
-        token_status = "Missing"
-
     config_lines = [
-        f"WS URL: {CRCON_WS_URL or 'Not set'}",
-        f"WS Token: {token_status}",
-        f"Heartbeat: {f'{CRCON_WS_HEARTBEAT}s' if CRCON_WS_HEARTBEAT else 'off'}",
-        f"TLS Verify: {'on' if CRCON_WS_VERIFY_SSL else 'off'}",
+        f"Webhook: http://{WEBHOOK_HOST}:{WEBHOOK_PORT}{WEBHOOK_PATH}",
+        f"Secret: {'set' if WEBHOOK_SECRET else 'not set'}",
     ]
     embed.add_field(name="Configuration", value="\n".join(config_lines), inline=False)
 
@@ -2946,38 +2733,27 @@ if __name__ == "__main__":
         exit(1)
 
     # Validate CRCON URL
-    crcon_url = os.getenv('CRCON_URL', 'http://localhost:8010')
-    if not crcon_url.startswith(('http://', 'https://')):
+    crcon_url_value = os.getenv('CRCON_URL', 'http://localhost:8010')
+    if not crcon_url_value.startswith(('http://', 'https://')):
         print("⚠️ WARNING: CRCON_URL should start with http:// or https://")
 
     # Validate kill feed prerequisites if enabled
     kill_feed_enabled = ENABLE_KILL_FEED
-    ws_url = CRCON_WS_URL
-    ws_token = CRCON_WS_TOKEN
-    if kill_feed_enabled:
-        missing = []
-        if not ws_url:
-            missing.append("CRCON_WS_URL")
-        if not ws_token:
-            missing.append("CRCON_WS_TOKEN (defaults to CRCON_API_KEY)")
-
-        if missing:
-            print("❌ ENABLE_KILL_FEED=true but the following settings are missing:", ", ".join(missing))
-            print("   Update your .env file or disable ENABLE_KILL_FEED")
-            exit(1)
+    if kill_feed_enabled and not WEBHOOK_HOST:
+        print("❌ ENABLE_KILL_FEED=true but webhook host is missing (KILL_WEBHOOK_HOST)")
+        exit(1)
 
     # Show configuration (without sensitive data)
-    print(f"🔗 CRCON: {crcon_url}")
+    print(f"🔗 CRCON: {crcon_url_value}")
     print(f"🔑 API Key: {'*' * 8}... (configured)")
     print(f"👑 Admin Role: {os.getenv('ADMIN_ROLE_NAME', 'admin')}")
     print(f"🤖 Bot Name: {os.getenv('BOT_NAME', 'HLLTankBot')}")
     print(f"⏱️ Update Interval: {get_update_interval()}s")
     print(f"🔄 Auto-Switch: {os.getenv('CRCON_AUTO_SWITCH', 'true')}")
     if kill_feed_enabled:
-        print("💥 Kill Feed: Enabled")
-        print(f"   WS URL: {ws_url}")
-        token_source = "custom token" if RAW_CRCON_WS_TOKEN else "CRCON_API_KEY"
-        print(f"   WS Token Source: {token_source}")
+        print("💥 Kill Feed: Enabled (Webhook mode)")
+        print(f"   Webhook: http://{WEBHOOK_HOST}:{WEBHOOK_PORT}{WEBHOOK_PATH}")
+        print(f"   Secret set: {'yes' if WEBHOOK_SECRET else 'no'}")
         keyword_total = sum(len(values) for values in TANK_WEAPON_KEYWORDS.values())
         print(f"   Tank Keywords: {keyword_total} entries ({TANK_KEYWORD_SOURCE})")
     else:
