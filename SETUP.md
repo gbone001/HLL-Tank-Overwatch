@@ -41,9 +41,11 @@
 | `BOT_NAME` | `HLLTankBot` | Name shown in game messages |
 | `BOT_AUTHOR` | `StoneyRebel` | Author shown in embed footer |
 | `LOG_CHANNEL_ID` | `0` | Discord channel for match logs (0 = disabled) |
-| `ENABLE_KILL_FEED` | `false` | Enable experimental tank-kill tracking |
-| `CRCON_WS_URL` | `ws://localhost:8010/ws/logs` | CRCON WebSocket endpoint (required when kill feed is enabled) |
-| `CRCON_WS_TOKEN` | `CRCON_API_KEY` | Bearer token for the CRCON WebSocket log stream (leave blank to reuse the API key) |
+| `ENABLE_KILL_FEED` | `false` | Enable tank-kill tracking via CRCON webhook |
+| `KILL_WEBHOOK_HOST` | `0.0.0.0` | Host/interface to bind the webhook listener |
+| `KILL_WEBHOOK_PORT` | `8081` | Port for the webhook listener (use `$PORT` on Railway) |
+| `KILL_WEBHOOK_PATH` | `/kill-webhook` | Path for the webhook POST endpoint |
+| `KILL_WEBHOOK_SECRET` | – | Optional shared secret expected in `X-Webhook-Secret` header |
 | `TANK_WEAPON_KEYWORDS` | – | JSON string or file path listing weapon keywords that count as tank kills |
 
 ## Discord Setup
@@ -97,20 +99,19 @@
    - Use `/server_info` for current server information
    - Run `/killfeed_status` to check kill feed health when tank tracking is enabled
 
-## Local Kill Feed Mock
+## Local Kill Feed Test (Webhook)
 
 For manual testing without a live CRCON feed:
 
-1. Install the dev dependency once:
+1. Start the bot locally with `ENABLE_KILL_FEED=true` (defaults: `KILL_WEBHOOK_PORT=8081`, `KILL_WEBHOOK_PATH=/kill-webhook`).
+2. Send a test kill payload:
    ```bash
-   npm install ws
+   curl -X POST http://localhost:8081/kill-webhook \
+     -H "Content-Type: application/json" \
+     -d '{"killer_team":"allies","victim_team":"axis","weapon":"75mm","killer_name":"Allied Gunner","victim_name":"Axis Tank","vehicle":"Panzer IV"}'
    ```
-2. Start the helper:
-   ```bash
-   node tools/mock_kill_feed_server.js --port 8765 --token local-dev
-   ```
-3. Set `.env` to point at the mock (`ENABLE_KILL_FEED=true`, `CRCON_WS_URL=ws://localhost:8765`, `CRCON_WS_TOKEN=local-dev` or leave blank to reuse `CRCON_API_KEY`).
-4. Run the bot, start a match, then tap **ENTER** in the mock terminal to stream canned tank kills (or pipe custom JSON) and watch the Discord embed update.
+   Include `-H "X-Webhook-Secret: <value>"` if you set `KILL_WEBHOOK_SECRET`.
+3. Run `/killfeed_status` to confirm the webhook listener is running and the last event is captured.
 
 ## Troubleshooting
 
@@ -118,7 +119,7 @@ For manual testing without a live CRCON feed:
 - **No admin permissions:** Make sure you have the role specified in `ADMIN_ROLE_NAME`
 - **CRCON not connecting:** Verify `CRCON_URL` and `CRCON_API_KEY` are correct
 - **Auto-switch not working:** Enable `CRCON_AUTO_SWITCH=true` and ensure CRCON connection is stable
-- **Kill feed idle:** Confirm `ENABLE_KILL_FEED=true`, CRCON WebSocket settings are valid, and inspect `/killfeed_status` for listener/connection details
+- **Kill feed idle:** Confirm `ENABLE_KILL_FEED=true`, CRCON webhook URL/secret are correct, and inspect `/killfeed_status` for listener details
 
 ## Support
 
