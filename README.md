@@ -214,28 +214,17 @@ Make sure to include `http://` or `https://`
 
 ## 🧪 Diagnostics & Manual Testing
 
-Need to validate the tank kill overlay without a production server? Use the mock WebSocket helper:
+Need to validate the tank kill overlay without a production server? Use a local webhook POST:
 
-1. Install the lightweight dev dependency (ignored by git):
+1) Start the bot locally with `ENABLE_KILL_FEED=true` (defaults: `KILL_WEBHOOK_PORT=8081`, `KILL_WEBHOOK_PATH=/kill-webhook`).
+2) Send a test kill payload:
    ```bash
-   npm install ws
+   curl -X POST http://localhost:8081/kill-webhook \
+     -H "Content-Type: application/json" \
+     -d '{"killer_team":"allies","victim_team":"axis","weapon":"75mm","killer_name":"Allied Gunner","victim_name":"Axis Tank","vehicle":"Panzer IV"}'
    ```
-2. Start the mock feed (defaults shown):
-   ```bash
-   node tools/mock_kill_feed_server.js --port 8765 --token local-dev
-   ```
-   - Press **ENTER** to emit the next canned tank kill
-   - Or paste raw JSON (one line) to broadcast custom payloads
-3. Point the bot at the mock feed in `.env`:
-   ```env
-   ENABLE_KILL_FEED=true
-   CRCON_WS_URL=ws://localhost:8765
-   CRCON_WS_TOKEN=local-dev  # leave blank to reuse CRCON_API_KEY
-   ```
-4. Run `python enhanced_discord_bot.py`, fire `/reverse_clock`, and start a match.
-5. Use `/killfeed_status` to confirm the listener is connected, then trigger sample kills from the mock terminal—tank counts should update immediately in the embed, CRCON broadcasts, and log output.
-
-Set `AUTO_INTERVAL=3000 node tools/mock_kill_feed_server.js` to continuously stream test kills while iterating on UI.
+   Include `-H "X-Webhook-Secret: <value>"` if you set `KILL_WEBHOOK_SECRET`.
+3) Run `/killfeed_status` to confirm the webhook listener is running and the last event is captured.
 
 ## 🏆 How It Works
 
@@ -272,9 +261,9 @@ Set `AUTO_INTERVAL=3000 node tools/mock_kill_feed_server.js` to continuously str
 - Use `/crcon_status` or `/test_map` for live diagnostics
 
 **Kill feed disabled or not updating:**
-- Ensure `ENABLE_KILL_FEED=true` plus valid `CRCON_WS_URL`/`CRCON_WS_TOKEN`
+- Ensure `ENABLE_KILL_FEED=true`, CRCON webhook URL points to your deployed listener, and secrets match
 - Start a match via `/reverse_clock` so the listener attaches to an active channel
-- Run `/killfeed_status` to confirm the WebSocket connection and inspect the latest event
+- Run `/killfeed_status` to confirm the webhook listener and inspect the latest event
 
 **Auto-switch not working:**
 - Set `CRCON_AUTO_SWITCH=true`
