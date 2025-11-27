@@ -12,6 +12,7 @@ import discord
 import datetime
 import json
 import aiohttp
+from aiohttp import web
 import logging
 import random
 from dataclasses import dataclass
@@ -628,11 +629,11 @@ class KillWebhookServer:
         return self._queue
 
     async def _run(self):
-        app = aiohttp.web.Application()
+        app = web.Application()
         app.router.add_post(self.path, self._handle_webhook)
-        self._runner = aiohttp.web.AppRunner(app)
+        self._runner = web.AppRunner(app)
         await self._runner.setup()
-        self._site = aiohttp.web.TCPSite(self._runner, self.host, self.port)
+        self._site = web.TCPSite(self._runner, self.host, self.port)
         await self._site.start()
         self._connected.set()
         logger.info(
@@ -652,15 +653,15 @@ class KillWebhookServer:
                 await self._runner.cleanup()
             logger.info("Kill webhook listener stopped")
 
-    async def _handle_webhook(self, request: aiohttp.web.Request):
+    async def _handle_webhook(self, request: web.Request):
         if self.secret:
             provided = request.headers.get("X-Webhook-Secret", "")
             if provided != self.secret:
-                return aiohttp.web.json_response({"status": "forbidden"}, status=403)
+                return web.json_response({"status": "forbidden"}, status=403)
         try:
             payload = await request.json()
         except Exception:
-            return aiohttp.web.json_response({"status": "bad json"}, status=400)
+            return web.json_response({"status": "bad json"}, status=400)
 
         event = KillFeedEvent(
             raw=payload,
@@ -677,7 +678,7 @@ class KillWebhookServer:
                 pass
             self._queue.put_nowait(event)
 
-        return aiohttp.web.json_response({"status": "ok"})
+        return web.json_response({"status": "ok"})
 
 
 kill_webhook_server: Optional[KillWebhookServer] = None
