@@ -22,6 +22,12 @@ from dotenv import load_dotenv
 from discord.ext import commands, tasks
 from datetime import timezone
 
+# Overlay broadcaster imports
+from broadcaster import Broadcaster
+from events import KillEvent, PlayerScore, ScoreboardSnapshot, TeamScore
+from sinks.discord_sink import DiscordSink
+from sinks.obs_sink import OBSSink
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +68,9 @@ WEBHOOK_PORT = kill_webhook_port()
 WEBHOOK_HOST = kill_webhook_host()
 WEBHOOK_PATH = kill_webhook_path()
 WEBHOOK_SECRET = kill_webhook_secret()
+OBS_SINK_BASE_URL = os.getenv("OBS_SINK_BASE_URL", "").strip()
+OBS_SINK_SECRET = os.getenv("OBS_SINK_SECRET", "").strip()
+MIN_SCOREBOARD_BROADCAST_INTERVAL = int(os.getenv("SCOREBOARD_BROADCAST_INTERVAL", "10"))
 TANK_EVENT_HISTORY_LIMIT = 25
 DEFAULT_TANK_WEAPON_KEYWORDS: Dict[str, List[str]] = {
     "cannon_shells": [
@@ -171,6 +180,27 @@ def _derive_keywords_from_tanks_file(path: str) -> Dict[str, List[str]]:
     }
 
 
+def _load_tank_library(path: str) -> List[Dict[str, Any]]:
+    """Load full tank definitions for matching kills to known vehicles."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return []
+    try:
+        data = json.loads(file_path.read_text(encoding='utf-8'))
+    except Exception as exc:
+        logger.warning("Failed to read tank library %s: %s", file_path, exc)
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    library: List[Dict[str, Any]] = []
+    for entry in data:
+        if isinstance(entry, dict):
+            library.append(entry)
+    return library
+
+
 def _merge_keyword_sets(base: Dict[str, List[str]], extra: Dict[str, List[str]]) -> Dict[str, List[str]]:
     merged: Dict[str, List[str]] = {k: list(v) for k, v in base.items()}
     for group, values in extra.items():
@@ -187,6 +217,7 @@ def _merge_keyword_sets(base: Dict[str, List[str]], extra: Dict[str, List[str]])
 
 
 TANK_WEAPON_KEYWORDS, TANK_KEYWORD_SOURCE = _load_tank_weapon_keywords()
+TANK_LIBRARY = _load_tank_library(tanks_file())
 
 intents = discord.Intents.default()
 intents.message_content = False
@@ -512,6 +543,25 @@ def _looks_like_tank_vehicle(text: str) -> bool:
     return any(token in lowered for token in tokens)
 
 
+def _match_tank_from_library(weapon_text: str, vehicle_text: str, vehicle_class: str, subtype: str) -> Optional[Dict[str, Any]]:
+    candidates = [weapon_text, vehicle_text, vehicle_class, subtype]
+    lowered_candidates = [c.lower() for c in candidates if c]
+
+    for entry in TANK_LIBRARY:
+        vehicle_name = str(entry.get("vehicle", "")).lower()
+        gun_name = str(entry.get("gun", "")).lower()
+        class_name = str(entry.get("class", "")).lower()
+
+        if any(vehicle_name and vehicle_name in cand for cand in lowered_candidates):
+            return entry
+        if any(gun_name and gun_name in cand for cand in lowered_candidates):
+            return entry
+        if any(class_name and class_name in cand for cand in lowered_candidates):
+            return entry
+
+    return None
+
+
 def detect_tank_kill(
     payload: Any,
     keyword_mapping: Optional[Dict[str, List[str]]] = None,
@@ -542,6 +592,12 @@ def detect_tank_kill(
         [weapon_text, vehicle_text, vehicle_class or "", subtype or ""],
         keywords,
     )
+
+    tank_match = _match_tank_from_library(weapon_text, vehicle_text, vehicle_class, subtype)
+    if not keyword_group and tank_match:
+        keyword_group = "tank_library"
+        keyword_match = tank_match.get("vehicle") or tank_match.get("gun") or tank_match.get("class")
+
     if not keyword_group and vehicle_class and _looks_like_tank_vehicle(vehicle_class):
         keyword_group, keyword_match = 'vehicle_class', vehicle_class
     if not keyword_group and subtype and _looks_like_tank_vehicle(subtype):
@@ -568,6 +624,11 @@ def detect_tank_kill(
         ['victim_team', 'target_team', 'player_team_2'],
     )
     vehicle_name = vehicle_text or vehicle_class or subtype
+
+    if tank_match:
+        vehicle_name = tank_match.get("vehicle", vehicle_name) or vehicle_name
+        vehicle_class = tank_match.get("class", vehicle_class) or vehicle_class
+        weapon_text = tank_match.get("gun", weapon_text) or weapon_text
 
     return TankKillDetection(
         killer_name=killer_name or 'Unknown',
@@ -751,6 +812,46 @@ async def _broadcast_tank_kill(team_key: str, detection: TankKillDetection, even
         except Exception as exc:
             logger.exception(f"Failed to record tank kill for clock {clock.channel_id}: {exc}")
 
+    broadcaster = _build_event_broadcaster(active_kill_feed_channel_id)
+    if broadcaster:
+        killer_team = normalize_team_name(detection.killer_team)
+        victim_team = normalize_team_name(detection.victim_team)
+        teamkill = bool(killer_team and victim_team and killer_team == victim_team)
+        suicide = bool(detection.killer_name and detection.victim_name and detection.killer_name == detection.victim_name)
+
+        weapon_detail = detection.weapon or detection.keyword_match or detection.vehicle
+        if detection.keyword_group == "tank_library" and detection.vehicle:
+            if detection.weapon and detection.vehicle.lower() not in detection.weapon.lower():
+                weapon_detail = f"{detection.weapon} ({detection.vehicle})"
+            else:
+                weapon_detail = detection.vehicle
+
+        kill_event = KillEvent(
+            time=event.received_at,
+            killer=detection.killer_name or None,
+            victim=detection.victim_name or None,
+            weapon=weapon_detail,
+            distance=None,
+            teamkill=teamkill,
+            suicide=suicide,
+        )
+
+        try:
+            await broadcaster.publish_kill(kill_event)
+        except Exception as exc:
+            logger.exception("Failed to broadcast kill event: %s", exc)
+
+    # Surface debug details for matched tank
+    if detection.keyword_group == "tank_library":
+        logger.info(
+            "Tank library match: %s (%s) vs %s (%s) using %s",
+            detection.killer_name,
+            detection.killer_team,
+            detection.victim_name,
+            detection.victim_team,
+            detection.keyword_match,
+        )
+
 
 def resolve_detection_team(detection: TankKillDetection) -> Optional[str]:
     killer_team = normalize_team_name(detection.killer_team)
@@ -763,6 +864,25 @@ def resolve_detection_team(detection: TankKillDetection) -> Optional[str]:
     if victim_team == 'axis':
         return 'allied'
     return None
+
+
+def _build_event_broadcaster(channel_id: Optional[int]) -> Optional[Broadcaster]:
+    sinks = []
+
+    # Discord sink tied to the active kill feed channel (if available)
+    if channel_id is not None:
+        channel = bot.get_channel(channel_id)
+        if channel:
+            sinks.append(DiscordSink(channel))
+
+    # OBS sink via external endpoint if configured
+    if OBS_SINK_BASE_URL:
+        sinks.append(OBSSink(OBS_SINK_BASE_URL, secret=OBS_SINK_SECRET))
+
+    if not sinks:
+        return None
+
+    return Broadcaster(sinks)
 
 
 def set_active_kill_feed_channel(channel_id: Optional[int]):
@@ -877,6 +997,7 @@ class ClockState:
         # Player scores by team
         self.player_scores = {'allied': {}, 'axis': {}}
         self.reset_tank_kills()
+        self._last_scoreboard_broadcast: Optional[datetime.datetime] = None
 
     def get_time_remaining(self):
         """Get time remaining in match"""
@@ -965,6 +1086,7 @@ class ClockState:
             # Update player scores if in tournament mode
             if self.tournament_mode:
                 self.update_player_scores()
+                await self.broadcast_scoreboard()
 
             # Only check for auto-switch if we have previous scores to compare
             # This prevents false triggers on first connection
@@ -1235,6 +1357,71 @@ class ClockState:
             self._process_team_scores(detailed_players.get('allied', []), 'allied')
             self._process_team_scores(detailed_players.get('axis', []), 'axis')
 
+    def build_scoreboard_snapshot(self) -> Optional[ScoreboardSnapshot]:
+        """Build a scoreboard snapshot from the current player_scores cache."""
+        teams: List[TeamScore] = []
+
+        match_id = (
+            self.match_start_time.isoformat()
+            if self.match_start_time
+            else f"channel-{self.channel_id or 'unknown'}"
+        )
+
+        for team_key in ('allied', 'axis'):
+            team_name = self.team_names.get(team_key, team_key.title())
+            flat_players: List[PlayerScore] = []
+
+            for squad_name, players in self.player_scores.get(team_key, {}).items():
+                for player in players:
+                    flat_players.append(
+                        PlayerScore(
+                            name=str(player.get('name', 'Unknown')),
+                            kills=int(player.get('kills') or 0),
+                            deaths=int(player.get('deaths') or 0),
+                            score=int(player.get('combat_score') or 0),
+                            squad=squad_name if squad_name != 'unknown' else None,
+                        )
+                    )
+
+            teams.append(
+                TeamScore(
+                    name=team_name,
+                    score=int(self.last_scores.get(team_key, 0)),
+                    players=flat_players,
+                )
+            )
+
+        if not any(team.players for team in teams):
+            return None
+
+        return ScoreboardSnapshot(
+            match_id=match_id,
+            updated_at=datetime.datetime.now(timezone.utc),
+            teams=teams,
+        )
+
+    async def broadcast_scoreboard(self):
+        snapshot = self.build_scoreboard_snapshot()
+        if not snapshot:
+            return
+
+        now = datetime.datetime.now(timezone.utc)
+        if (
+            self._last_scoreboard_broadcast
+            and (now - self._last_scoreboard_broadcast).total_seconds() < MIN_SCOREBOARD_BROADCAST_INTERVAL
+        ):
+            return
+
+        broadcaster = _build_event_broadcaster(self.channel_id)
+        if not broadcaster:
+            return
+
+        try:
+            await broadcaster.publish_scoreboard(snapshot)
+            self._last_scoreboard_broadcast = now
+        except Exception as exc:
+            logger.exception("Failed to broadcast scoreboard: %s", exc)
+
     def _process_team_scores(self, team_data, team_key):
         """Process individual team's player scores"""
         # Handle list of players directly
@@ -1278,6 +1465,8 @@ class ClockState:
 
         player_name = player_data.get('player', player_data.get('name', 'Unknown'))
         combat_score = player_data.get('combat', player_data.get('combat_score', 0))
+        kills = player_data.get('kills', player_data.get('kill', 0))
+        deaths = player_data.get('deaths', player_data.get('death', 0))
 
         # Normalize squad name to lowercase for case-insensitive matching
         squad_name_lower = squad_name.lower() if squad_name else 'unknown'
@@ -1288,7 +1477,9 @@ class ClockState:
 
         self.player_scores[team_key][squad_name_lower].append({
             'name': player_name,
-            'combat_score': combat_score
+            'combat_score': combat_score,
+            'kills': kills,
+            'deaths': deaths,
         })
 
     def calculate_dmt_score(self, team_key):
@@ -2759,6 +2950,12 @@ if __name__ == "__main__":
         print(f"   Tank Keywords: {keyword_total} entries ({TANK_KEYWORD_SOURCE})")
     else:
         print("💥 Kill Feed: Disabled")
+
+    if OBS_SINK_BASE_URL:
+        print(f"📺 OBS Sink: Enabled -> {OBS_SINK_BASE_URL}")
+        print(f"   Secret set: {'yes' if OBS_SINK_SECRET else 'no'}")
+    else:
+        print("📺 OBS Sink: Disabled (set OBS_SINK_BASE_URL to enable)")
 
     log_channel = os.getenv('LOG_CHANNEL_ID', '0')
     if log_channel != '0':

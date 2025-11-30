@@ -14,6 +14,7 @@ A Discord bot for Hell Let Loose communities that tracks time control of the cen
 - [🎮 Discord Setup](#-discord-setup)
 - [📖 Usage](#-usage)
 - [🐛 Troubleshooting](#-troubleshooting)
+- [📺 OBS Overlay](#-obs-overlay)
 - [🤝 Contributing](#-contributing)
 
 > **Before you start:** you need a Discord bot token (`DISCORD_TOKEN`) and a CRCON API key (`CRCON_API_KEY`). Without both values the bot exits immediately (same behavior in Railway and local runs).
@@ -25,6 +26,7 @@ A Discord bot for Hell Let Loose communities that tracks time control of the cen
 - **🎮 Live Game Integration** - Shows current map, players, and game time
 - **📊 Real-time Stats** - Live Discord embeds with current standings
 - **💥 Tank Kill Tracking** - Optional CRCON kill feed stream powers tank scoreboards and highlights
+- **📺 OBS Overlay** - Killfeed/scoreboard events fan out to an OBS-side FastAPI service + browser overlay
 - **🏆 Match Results** - Automatic results posting when matches end
 - **⚔️ In-Game Messages** - Notifications sent to all players with current times
 
@@ -136,6 +138,9 @@ The bot creates interactive Discord embeds showing:
 | `KILL_WEBHOOK_PATH` | `/kill-webhook` | Path for the webhook POST endpoint |
 | `KILL_WEBHOOK_SECRET` | – | Optional shared secret expected in `X-Webhook-Secret` header |
 | `TANK_WEAPON_KEYWORDS` | – | JSON string or file path listing weapon keywords that count as tank kills |
+| `OBS_SINK_BASE_URL` | – | (Optional) URL for OBS overlay service, e.g. `https://jpkillfeed.anzr.org` |
+| `OBS_SINK_SECRET` | – | (Optional) Shared secret sent in `X-Obs-Secret` to the OBS service |
+| `SCOREBOARD_BROADCAST_INTERVAL` | `10` | Minimum seconds between scoreboard publishes to Discord/OBS |
 
 > Note: Previous WebSocket/polling kill feed integration was removed in favor of the CRCON kill webhook; keep these settings handy only if you reintroduce the older transport in the future.
 
@@ -274,6 +279,46 @@ Need to validate the tank kill overlay without a production server? Use a local 
 ### Logs
 
 Check Railway logs or local `logs/bot.log` file for detailed error information. Slash commands like `/crcon_status` and `/test_map` provide additional runtime context without digging through logs.
+
+## 📺 OBS Overlay
+
+The bot now fans out killfeed and scoreboard events to an OBS-side service and overlay.
+
+**Files**
+- `obs_service.py`: FastAPI app that accepts POSTs and broadcasts over WebSocket (`/ws/killfeed`, `/ws/scoreboard`).
+- `scoreboard_overlay.html`: Browser Source overlay (transparent) for OBS that listens to `/ws/scoreboard`.
+
+**Run the OBS service locally**
+```bash
+pip install -r requirements.txt  # includes FastAPI/uvicorn
+uvicorn obs_service:app --reload  # binds 0.0.0.0:8000 by default
+```
+Optional security: set `OBS_SECRET=<shared secret>` in the environment on the OBS PC; the bot will send the same value via `OBS_SINK_SECRET` (header `X-Obs-Secret`).
+
+**Configure the bot**
+- Set `OBS_SINK_BASE_URL` to the public/Cloudflare URL of the OBS service (e.g. `https://jpkillfeed.anzr.org`).
+- Start a match; killfeed events flow to both Discord and OBS, and scoreboard snapshots publish whenever player stats refresh.
+
+**Use the overlay in OBS**
+- Add a Browser Source pointing to the local file `scoreboard_overlay.html`.
+- Default WS endpoint: `ws://127.0.0.1:8000/ws/scoreboard`. Override via query string: `file:///.../scoreboard_overlay.html?ws=wss://your-url/ws/scoreboard` (use `wss://` with Cloudflare).
+- Size: match your canvas (e.g. 1920×1080); enable transparency.
+
+**Smoke-test endpoints**
+```bash
+# Killfeed test
+curl -X POST http://127.0.0.1:8000/obs/kill -H "Content-Type: application/json" \
+  -d '{"killer":"Allied","victim":"Axis","weapon":"75mm","teamkill":false,"suicide":false,"time":"2024-01-01T00:00:00Z"}'
+
+# Scoreboard test
+curl -X POST http://127.0.0.1:8000/obs/scoreboard -H "Content-Type: application/json" -d '{
+  "match_id":"test-123","updated_at":"2024-01-01T00:00:00Z",
+  "teams":[
+    {"name":"Allies","score":2,"players":[{"name":"Alice","kills":5,"deaths":3,"score":500}]},
+    {"name":"Axis","score":1,"players":[{"name":"Bob","kills":4,"deaths":4,"score":400}]}
+  ]
+}'
+```
 
 ## 🤝 Contributing
 

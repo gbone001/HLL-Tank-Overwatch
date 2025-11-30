@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>HLL Scoreboard Overlay</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: transparent !important;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .scoreboard-root {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+    }
+
+    .scoreboard-card {
+      display: flex;
+      gap: 16px;
+      padding: 16px 24px;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.6);
+      box-shadow: 0 0 20px rgba(0,0,0,0.8);
+      color: #f0f0f0;
+      max-width: 90vw;
+      max-height: 80vh;
+    }
+
+    .team-column {
+      flex: 1;
+      min-width: 300px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .team-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .team-name {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .team-score {
+      font-size: 18px;
+      font-weight: 600;
+      opacity: 0.9;
+    }
+
+    .team-left .team-name {
+      color: #a8d1ff;
+    }
+
+    .team-right .team-name {
+      color: #ffb3b3;
+    }
+
+    .subtitle {
+      font-size: 12px;
+      opacity: 0.7;
+      margin-bottom: 8px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    thead {
+      opacity: 0.8;
+      border-bottom: 1px solid rgba(255,255,255,0.15);
+    }
+
+    th, td {
+      padding: 2px 4px;
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    th.stat, td.stat {
+      text-align: right;
+      width: 40px;
+    }
+
+    tbody tr:nth-child(odd) {
+      background-color: rgba(255,255,255,0.02);
+    }
+
+    tbody tr:nth-child(even) {
+      background-color: rgba(0,0,0,0.2);
+    }
+
+    .footer {
+      position: absolute;
+      bottom: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 11px;
+      color: rgba(255,255,255,0.6);
+      text-shadow: 0 0 4px rgba(0,0,0,0.8);
+    }
+
+    .status {
+      position: absolute;
+      top: 8px;
+      right: 16px;
+      font-size: 11px;
+      color: rgba(255,255,255,0.7);
+    }
+
+    .status span {
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+    }
+
+    .status-ok span {
+      border: 1px solid rgba(0, 200, 0, 0.7);
+    }
+
+    .status-error span {
+      border: 1px solid rgba(200, 0, 0, 0.7);
+    }
+
+    .empty-message {
+      font-size: 16px;
+      opacity: 0.7;
+    }
+  </style>
+</head>
+<body>
+  <div class="scoreboard-root">
+    <div class="scoreboard-card" id="scoreboardCard">
+      <div class="empty-message" id="emptyMessage">
+        Waiting for scoreboard data...
+      </div>
+
+      <div class="team-column team-left" id="teamLeft" style="display:none;">
+        <div class="team-header">
+          <div class="team-name" id="teamLeftName">Allies</div>
+          <div class="team-score" id="teamLeftScore">0</div>
+        </div>
+        <div class="subtitle">Top players</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Player</th>
+              <th class="stat">K</th>
+              <th class="stat">D</th>
+              <th class="stat">Score</th>
+            </tr>
+          </thead>
+          <tbody id="teamLeftBody"></tbody>
+        </table>
+      </div>
+
+      <div class="team-column team-right" id="teamRight" style="display:none;">
+        <div class="team-header">
+          <div class="team-name" id="teamRightName">Axis</div>
+          <div class="team-score" id="teamRightScore">0</div>
+        </div>
+        <div class="subtitle">Top players</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Player</th>
+              <th class="stat">K</th>
+              <th class="stat">D</th>
+              <th class="stat">Score</th>
+            </tr>
+          </thead>
+          <tbody id="teamRightBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="status" id="statusWrapper">
+    <span id="statusText">disconnected</span>
+  </div>
+  <div class="footer" id="footerText"></div>
+
+  <script>
+    (function () {
+      const DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws/scoreboard";
+
+      const params = new URLSearchParams(window.location.search);
+      const overrideUrl = params.get("ws") || params.get("scoreboard");
+      const WS_URL = (overrideUrl || DEFAULT_WS_URL).trim();
+
+      const statusWrapper = document.getElementById("statusWrapper");
+      const statusText = document.getElementById("statusText");
+      const footerText = document.getElementById("footerText");
+
+      const emptyMessage = document.getElementById("emptyMessage");
+      const teamLeft = document.getElementById("teamLeft");
+      const teamRight = document.getElementById("teamRight");
+
+      const teamLeftName = document.getElementById("teamLeftName");
+      const teamLeftScore = document.getElementById("teamLeftScore");
+      const teamLeftBody = document.getElementById("teamLeftBody");
+
+      const teamRightName = document.getElementById("teamRightName");
+      const teamRightScore = document.getElementById("teamRightScore");
+      const teamRightBody = document.getElementById("teamRightBody");
+
+      function setStatus(text, stateClass) {
+        statusText.textContent = text;
+        statusWrapper.classList.remove("status-ok", "status-error");
+        if (stateClass) {
+          statusWrapper.classList.add(stateClass);
+        }
+      }
+
+      function renderScoreboard(data) {
+        if (!data || !data.teams || data.teams.length === 0) {
+          emptyMessage.style.display = "block";
+          teamLeft.style.display = "none";
+          teamRight.style.display = "none";
+          return;
+        }
+
+        emptyMessage.style.display = "none";
+
+        const t1 = data.teams[0];
+        const t2 = data.teams[1] || { name: "Unknown", score: 0, players: [] };
+
+        // Left team
+        teamLeftName.textContent = t1.name || "Team 1";
+        teamLeftScore.textContent = t1.score ?? 0;
+        teamLeftBody.innerHTML = "";
+        const t1Players = (t1.players || []).slice().sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, 12);
+        for (const p of t1Players) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${p.name || "Unknown"}</td>
+            <td class="stat">${p.kills ?? 0}</td>
+            <td class="stat">${p.deaths ?? 0}</td>
+            <td class="stat">${p.score ?? 0}</td>
+          `;
+          teamLeftBody.appendChild(tr);
+        }
+        teamLeft.style.display = "flex";
+
+        // Right team
+        teamRightName.textContent = t2.name || "Team 2";
+        teamRightScore.textContent = t2.score ?? 0;
+        teamRightBody.innerHTML = "";
+        const t2Players = (t2.players || []).slice().sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, 12);
+        for (const p of t2Players) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${p.name || "Unknown"}</td>
+            <td class="stat">${p.kills ?? 0}</td>
+            <td class="stat">${p.deaths ?? 0}</td>
+            <td class="stat">${p.score ?? 0}</td>
+          `;
+          teamRightBody.appendChild(tr);
+        }
+        teamRight.style.display = "flex";
+
+        if (data.updated_at) {
+          const d = new Date(data.updated_at);
+          footerText.textContent = `Last update: ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+        } else {
+          footerText.textContent = "";
+        }
+      }
+
+      function connect() {
+        setStatus("connecting", null);
+        const ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+          setStatus("live", "status-ok");
+        };
+
+        ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type !== "scoreboard") return;
+            renderScoreboard(msg.data);
+          } catch (err) {
+            console.error("Error parsing scoreboard message", err);
+            setStatus("error", "status-error");
+          }
+        };
+
+        ws.onclose = () => {
+          setStatus("reconnecting", "status-error");
+          setTimeout(connect, 5000);
+        };
+
+        ws.onerror = (err) => {
+          console.error("Scoreboard WS error", err);
+          ws.close();
+        };
+      }
+
+      connect();
+    })();
+  </script>
+</body>
+</html>
