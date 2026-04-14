@@ -1538,6 +1538,11 @@ async def safe_edit_message(message, **kwargs):
         return False
 
 
+async def post_clock_message(channel, embed: discord.Embed, view: discord.ui.View):
+    """Post the persistent clock control message to the channel."""
+    return await channel.send(embed=embed, view=view)
+
+
 def build_tank_kill_field(clock: 'ClockState', include_last: bool = False) -> str:
     allied_name = clock.team_names.get('allied', 'Allies')
     axis_name = clock.team_names.get('axis', 'Axis')
@@ -1665,7 +1670,7 @@ class StartControls(discord.ui.View):
             )
 
         # Respond to Discord immediately to prevent timeout
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         clock = clocks[self.channel_id]
         clock.match_start_time = datetime.datetime.now(timezone.utc)
@@ -1681,7 +1686,7 @@ class StartControls(discord.ui.View):
 
         # Update the embed first
         await safe_edit_message(clock.message, embed=build_embed(clock), view=view)
-        await interaction.followup.send("✅ Match started! Connecting to CRCON...", ephemeral=True)
+        await interaction.edit_original_response(content="✅ Match started! Connecting to CRCON...")
 
         # Connect to CRCON after responding to Discord
         crcon_connected = await clock.connect_crcon()
@@ -1830,11 +1835,9 @@ class TimerControls(discord.ui.View):
         clocks[self.channel_id] = ClockState(self.channel_id)
         clock = clocks[self.channel_id]
         view = StartControls(self.channel_id)
-
-        await interaction.response.defer()
         embed = build_embed(clock)
-        await interaction.followup.send(embed=embed, view=view)
-        clock.message = await interaction.original_response()
+        await interaction.response.send_message("✅ Clock reset.", ephemeral=True)
+        clock.message = await post_clock_message(interaction.channel, embed=embed, view=view)
 
     @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger)
     async def stop_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2252,7 +2255,7 @@ async def reverse_clock(interaction: discord.Interaction):
     view = StartControls(channel_id)
 
     await interaction.response.send_message("✅ HLL Tank Overwatch clock ready!", ephemeral=True)
-    posted_message = await interaction.channel.send(embed=embed, view=view)
+    posted_message = await post_clock_message(interaction.channel, embed=embed, view=view)
     clocks[channel_id].message = posted_message
 
 
