@@ -977,6 +977,7 @@ class ClockState:
         # DMT Scoring (always enabled)
         self.tournament_mode = True  # Always use DMT scoring
         self.team_names = {'allied': 'Allies', 'axis': 'Axis'}
+        self.ingame_messages = True  # Toggle for sending messages to players in-game
         # Squad mapping: which squads represent which crews
         self.squad_config = {
             'allied': {
@@ -1179,13 +1180,10 @@ class ClockState:
             # Start the clock if this is the first switch
             if not self.clock_started:
                 self.clock_started = True
-
+        
         # Send notification to game with DMT scores
         if self.crcon_client:
-            team_name = self.team_names.get(
-                'allied' if team == 'A' else 'axis',
-                'Allies' if team == 'A' else 'Axis',
-            )
+            team_name = self.team_names.get('allied' if team == 'A' else 'axis', 'Allies' if team == 'A' else 'Axis')
             allied_scores = self.calculate_dmt_score('allied')
             axis_scores = self.calculate_dmt_score('axis')
             team_a_name = self.team_names['allied']
@@ -1357,71 +1355,6 @@ class ClockState:
             self._process_team_scores(detailed_players.get('allied', []), 'allied')
             self._process_team_scores(detailed_players.get('axis', []), 'axis')
 
-    def build_scoreboard_snapshot(self) -> Optional[ScoreboardSnapshot]:
-        """Build a scoreboard snapshot from the current player_scores cache."""
-        teams: List[TeamScore] = []
-
-        match_id = (
-            self.match_start_time.isoformat()
-            if self.match_start_time
-            else f"channel-{self.channel_id or 'unknown'}"
-        )
-
-        for team_key in ('allied', 'axis'):
-            team_name = self.team_names.get(team_key, team_key.title())
-            flat_players: List[PlayerScore] = []
-
-            for squad_name, players in self.player_scores.get(team_key, {}).items():
-                for player in players:
-                    flat_players.append(
-                        PlayerScore(
-                            name=str(player.get('name', 'Unknown')),
-                            kills=int(player.get('kills') or 0),
-                            deaths=int(player.get('deaths') or 0),
-                            score=int(player.get('combat_score') or 0),
-                            squad=squad_name if squad_name != 'unknown' else None,
-                        )
-                    )
-
-            teams.append(
-                TeamScore(
-                    name=team_name,
-                    score=int(self.last_scores.get(team_key, 0)),
-                    players=flat_players,
-                )
-            )
-
-        if not any(team.players for team in teams):
-            return None
-
-        return ScoreboardSnapshot(
-            match_id=match_id,
-            updated_at=datetime.datetime.now(timezone.utc),
-            teams=teams,
-        )
-
-    async def broadcast_scoreboard(self):
-        snapshot = self.build_scoreboard_snapshot()
-        if not snapshot:
-            return
-
-        now = datetime.datetime.now(timezone.utc)
-        if (
-            self._last_scoreboard_broadcast
-            and (now - self._last_scoreboard_broadcast).total_seconds() < MIN_SCOREBOARD_BROADCAST_INTERVAL
-        ):
-            return
-
-        broadcaster = _build_event_broadcaster(self.channel_id)
-        if not broadcaster:
-            return
-
-        try:
-            await broadcaster.publish_scoreboard(snapshot)
-            self._last_scoreboard_broadcast = now
-        except Exception as exc:
-            logger.exception("Failed to broadcast scoreboard: %s", exc)
-
     def _process_team_scores(self, team_data, team_key):
         """Process individual team's player scores"""
         # Handle list of players directly
@@ -1465,8 +1398,6 @@ class ClockState:
 
         player_name = player_data.get('player', player_data.get('name', 'Unknown'))
         combat_score = player_data.get('combat', player_data.get('combat_score', 0))
-        kills = player_data.get('kills', player_data.get('kill', 0))
-        deaths = player_data.get('deaths', player_data.get('death', 0))
 
         # Normalize squad name to lowercase for case-insensitive matching
         squad_name_lower = squad_name.lower() if squad_name else 'unknown'
@@ -1487,35 +1418,31 @@ class ClockState:
         if not self.tournament_mode:
             return 0
 
-        # Get squad configuration for this team
-        squad_config = self.squad_config.get(team_key, {})
         player_scores = self.player_scores.get(team_key, {})
 
-        # Calculate combat score: 3 × (Crew1 High + Crew2 High + Crew3 High + Crew4 High)
+        # Calculate combat score: 3 × (sum of highest scorer from EACH squad)
+        # Count ALL squads, not just configured ones
         crew_scores = []
-        for crew_num in range(1, 5):
-            crew_key = f'crew{crew_num}'
-            squad_name = squad_config.get(crew_key, '')
+        commander_score = 0
 
-            # Get all players in this squad (case-insensitive lookup)
-            squad_name_lower = squad_name.lower() if squad_name else ''
-            squad_players = player_scores.get(squad_name_lower, [])
+        for squad_name, squad_players in player_scores.items():
+            if not squad_players:
+                continue
 
-            if squad_players:
-                # Find highest combat score in this crew
-                highest_score = max(p['combat_score'] for p in squad_players)
-                crew_scores.append(highest_score)
+            # Find highest combat score in this squad
+            highest_score = max(p['combat_score'] for p in squad_players)
+
+            # Check if this is a commander squad (usually 'command' or 'commander')
+            if squad_name.lower() in ['command', 'commander', 'cmd']:
+                commander_score = highest_score
             else:
-                crew_scores.append(0)
+                crew_scores.append(highest_score)
 
-        # Get commander score (case-insensitive lookup)
-        commander_squad = squad_config.get('commander', '')
-        commander_squad_lower = commander_squad.lower() if commander_squad else ''
-        commander_players = player_scores.get(commander_squad_lower, [])
-        commander_score = max((p['combat_score'] for p in commander_players), default=0)
-
-        # Calculate combat total
+        # Calculate combat total: 3 × (sum of all squad highs) + commander
         combat_total = 3 * sum(crew_scores) + commander_score
+
+        # Debug logging to help diagnose score issues
+        logger.debug(f"DMT Calc [{team_key}]: {len(crew_scores)} squads found, highs={crew_scores}, commander={commander_score}, combat_total={combat_total}")
 
         # Calculate cap score (time in seconds × 0.5)
         cap_seconds = self.total_time('A' if team_key == 'allied' else 'B')
@@ -1715,7 +1642,7 @@ def build_embed(clock: ClockState):
     # Footer with connection status
     connection_status = "🟢 CRCON Connected" if clock.crcon_client else "🔴 CRCON Disconnected"
     auto_status = " | 🤖 Auto ON" if clock.auto_switch else " | 🤖 Auto OFF"
-
+    
     footer_text = f"Match Clock by {os.getenv('BOT_AUTHOR', 'StoneyRebel')} | {connection_status}{auto_status}"
     if game_info.get('last_update'):
         footer_text += f" | Updated: {game_info['last_update']}"
@@ -1765,10 +1692,7 @@ class StartControls(discord.ui.View):
             # Send start message with DMT scoring info
             team_a = clock.team_names['allied']
             team_b = clock.team_names['axis']
-            start_msg = (
-                f"🏆 HLL Tank Overwatch: {team_a} vs {team_b} | "
-                "DMT Scoring Active | Combat + Cap Time = Total Score"
-            )
+            start_msg = f"🏆 HLL Tank Overwatch: {team_a} vs {team_b} | DMT Scoring Active | Combat + Cap Time = Total Score"
 
             await clock.crcon_client.send_message(start_msg)
             await interaction.edit_original_response(content="✅ Match started with CRCON!")
@@ -1838,9 +1762,23 @@ class TimerControls(discord.ui.View):
 
         await interaction.response.defer()
         await safe_edit_message(clock.message, embed=build_embed(clock), view=self)
-
+        
         if clock.crcon_client:
             await clock.crcon_client.send_message(f"🤖 Auto-switch {status}")
+
+    @discord.ui.button(label="💬 Msgs", style=discord.ButtonStyle.secondary)
+    async def toggle_ingame_messages(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not user_is_admin(interaction):
+            return await interaction.response.send_message("❌ Admin role required.", ephemeral=True)
+
+        clock = clocks[self.channel_id]
+        clock.ingame_messages = not clock.ingame_messages
+
+        status = "ON" if clock.ingame_messages else "OFF"
+
+        await interaction.response.defer()
+        await safe_edit_message(clock.message, embed=build_embed(clock), view=self)
+        await interaction.followup.send(f"💬 In-game messages: **{status}**", ephemeral=True)
 
     @discord.ui.button(label="📊 Stats", style=discord.ButtonStyle.secondary)
     async def show_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1920,8 +1858,8 @@ class TimerControls(discord.ui.View):
             clock.active = None
             clock.started = False
 
-        # Send final message to game with DMT scores
-        if clock.crcon_client:
+        # Send final message to game with DMT scores (if enabled)
+        if clock.crcon_client and clock.ingame_messages:
             allied_scores = clock.calculate_dmt_score('allied')
             axis_scores = clock.calculate_dmt_score('axis')
             team_a_name = clock.team_names['allied']
@@ -2061,10 +1999,7 @@ class TimerControls(discord.ui.View):
 
         # Send notification with DMT scores
         if clock.crcon_client:
-            team_name = clock.team_names.get(
-                'allied' if team == 'A' else 'axis',
-                'Allies' if team == 'A' else 'Axis',
-            )
+            team_name = clock.team_names.get('allied' if team == 'A' else 'axis', 'Allies' if team == 'A' else 'Axis')
             allied_scores = clock.calculate_dmt_score('allied')
             axis_scores = clock.calculate_dmt_score('axis')
             team_a_name = clock.team_names['allied']
@@ -2196,8 +2131,8 @@ async def auto_stop_match(clock: ClockState, game_info: dict):
             clock.active = None
             clock.started = False
 
-        # Send final message to game with DMT scores
-        if clock.crcon_client:
+        # Send final message to game with DMT scores (if enabled)
+        if clock.crcon_client and clock.ingame_messages:
             allied_scores = clock.calculate_dmt_score('allied')
             axis_scores = clock.calculate_dmt_score('axis')
             team_a_name = clock.team_names['allied']
